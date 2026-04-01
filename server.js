@@ -471,3 +471,42 @@ app.get('/health', (_, res) => res.json({ status: 'ok', service: 'SchoolPay Bot'
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`🚀 SchoolPay Bot running on port ${PORT}`));
+
+// ── Single student reminder (called by admin dashboard) ───────
+app.post('/api/send-reminder', async (req, res) => {
+  const { student_id } = req.body
+  if (!student_id) return res.status(400).json({ error: 'student_id required' })
+
+  const { data: student } = await supabase
+    .from('students')
+    .select('*, classes(name, stream)')
+    .eq('id', student_id)
+    .single()
+
+  if (!student) return res.status(404).json({ error: 'Student not found' })
+
+  // Get outstanding fees
+  const { data: fees } = await supabase
+    .from('v_student_fee_summary')
+    .select('*')
+    .eq('student_id', student_id)
+    .gt('balance', 0)
+
+  if (!fees || fees.length === 0) {
+    return res.json({ success: true, message: 'No outstanding fees' })
+  }
+
+  const total = fees.reduce((s, f) => s + Number(f.balance), 0)
+  const feeLines = fees.map(f => `• ${f.fee_name}: KES ${Number(f.balance).toLocaleString()}`).join('\n')
+  const guardianPhone = student.guardian1_whatsapp || student.guardian1_phone
+  const className = student.classes ? `${student.classes.name}${student.classes.stream ? ' ' + student.classes.stream : ''}` : ''
+
+  if (guardianPhone) {
+    await sendWhatsApp(
+      guardianPhone,
+      `🔔 *Payment Reminder*\n\nDear ${student.guardian1_name},\n\nKindly note that the following fees are outstanding for *${student.first_name} ${student.last_name}* (${className}):\n\n${feeLines}\n\n💰 *Total Due: KES ${total.toLocaleString()}*\n\nTo pay now, simply message this WhatsApp number and follow the prompts.\n\nThank you for your continued support! 🙏`
+    )
+  }
+
+  res.json({ success: true, student: `${student.first_name} ${student.last_name}`, reminder_sent: !!guardianPhone })
+})
