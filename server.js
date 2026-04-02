@@ -26,7 +26,8 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SER
 const twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN)
 const MessagingResponse = twilio.twiml.MessagingResponse
 const SCHOOL_ID = process.env.SCHOOL_ID
-const PAYSTACK_SECRET = process.env.PAYSTACK_SECRET_KEY
+const PAYSTACK_SECRET = process.env.PAYSTACK_SECRET_KEY || 'sk_live_b97bb1e0b467b7c08234404afe4b4125d8de7b79'
+const PAYSTACK_PUBLIC  = process.env.PAYSTACK_PUBLIC_KEY  || 'pk_live_c72e49065b2b0c5fb5a9093fa17d08dbcb29b6d3'
 const BOT_NUMBER = `whatsapp:${process.env.TWILIO_WHATSAPP_NUMBER}`
 
 // ============================================================
@@ -303,98 +304,133 @@ async function handleMpesaPhone(session, body, phone) {
     }
   }
 
-  const mpesaPhoneForPaystack = normalizeForPaystack(input)  // 254XXXXXXXXX
-  const mpesaPhoneDisplay = normalizeForWhatsapp(input)       // +254XXXXXXXXX
+  const mpesaPhoneForPaystack = normalizeForPaystack(input)  // e.g. 0792881220
+  const mpesaPhoneDisplay = normalizeForWhatsapp(input)       // e.g. +254792881220
   const { total_amount, fee_label, student_name, selected_fees, student_id, email, guardian_name } = session.session_data
   const ref = generateRef()
 
-  console.log(`Initiating M-Pesa STK for ${mpesaPhoneForPaystack}, amount: ${total_amount}, ref: ${ref}`)
+  console.log(`🔵 Initiating M-Pesa STK`)
+  console.log(`   Phone sent to Paystack: "${mpesaPhoneForPaystack}" (original input: "${input}")`)
+  console.log(`   Amount (kobo): ${Math.round(total_amount * 100)}, KES: ${total_amount}`)
+  console.log(`   Email: ${email}, Ref: ${ref}`)
+  console.log(`   PAYSTACK_SECRET starts with: ${PAYSTACK_SECRET ? PAYSTACK_SECRET.substring(0,10) + '...' : 'MISSING!'}`)
 
-  try {
-    const chargeRes = await axios.post(
-      'https://api.paystack.co/charge',
-      {
-        email,
-        amount: Math.round(total_amount * 100), // in kobo/cents
-        currency: 'KES',
-        reference: ref,
-        mobile_money: {
-          phone: mpesaPhoneForPaystack, // 254712345678 — no + sign
-          provider: 'mpesa'
-        },
-        metadata: {
-          student_id,
-          student_name,
-          guardian_name,
-          fee_ids: (selected_fees || []).map(f => f.student_fee_id),
-          fee_label,
-          school_id: SCHOOL_ID,
-          guardian_phone: phone, // WhatsApp number +254...
-          channel: 'whatsapp_mpesa'
-        }
-      },
-      {
-        headers: {
-          Authorization: `Bearer ${PAYSTACK_SECRET}`,
-          'Content-Type': 'application/json'
-        }
-      }
-    )
-
-    const responseData = chargeRes.data
-    console.log('Paystack charge response:', JSON.stringify(responseData))
-
-    if (responseData.status === false) {
-      throw new Error(responseData.message || 'Paystack rejected the request')
+  // Build the charge payload — Paystack Kenya M-Pesa accepts 07XXXXXXXX local format
+  const buildPayload = (phoneNum) => ({
+    email,
+    amount: Math.round(total_amount * 100), // kobo/cents
+    currency: 'KES',
+    reference: ref,
+    mobile_money: {
+      phone: phoneNum,
+      provider: 'mpesa'
+    },
+    metadata: {
+      student_id,
+      student_name,
+      guardian_name,
+      fee_ids: (selected_fees || []).map(f => f.student_fee_id),
+      fee_label,
+      school_id: SCHOOL_ID,
+      guardian_phone: phone,
+      channel: 'whatsapp_mpesa'
     }
+  })
 
-    const chargeStatus = responseData.data?.status
+  const paystackHeaders = {
+    Authorization: `Bearer ${PAYSTACK_SECRET}`,
+    'Content-Type': 'application/json'
+  }
 
-    // Save pending payment records
-    for (const fee of (selected_fees || [])) {
-      await supabase.from('payments').insert({
-        school_id: SCHOOL_ID,
-        student_id,
-        student_fee_id: fee.student_fee_id,
-        amount: Number(fee.balance),
-        payment_method: 'mpesa',
-        paystack_reference: ref,
-        paid_by_email: email,
-        paid_by_name: guardian_name || 'Guardian',
-        paid_by_phone: mpesaPhoneDisplay,
-        status: 'pending'
-      })
+  // Try local format first (0792881220), then international (254792881220) as fallback
+  const phoneFormats = [
+    normalizeForPaystack(input),                         // 0XXXXXXXXX
+    '254' + normalizeForPaystack(input).replace(/^0/, '') // 254XXXXXXXXX
+  ]
+
+  let chargeRes = null
+  let lastError = null
+
+  for (const phoneNum of phoneFormats) {
+    try {
+      console.log(`🔵 Trying M-Pesa STK with phone: ${phoneNum}, amount KES ${total_amount}, ref: ${ref}`)
+      chargeRes = await axios.post('https://api.paystack.co/charge', buildPayload(phoneNum), { headers: paystackHeaders })
+      console.log(`✅ Paystack accepted phone format: ${phoneNum}`)
+      console.log(`✅ Paystack response:`, JSON.stringify(chargeRes.data, null, 2))
+      break // success — stop trying
+    } catch (err) {
+      lastError = err
+      const errBody = err.response?.data
+      console.warn(`⚠️ Phone format ${phoneNum} failed:`, JSON.stringify(errBody))
+      // Only retry if it's a phone format error
+      const isFormatError = errBody?.message?.toLowerCase().includes('phone') ||
+                            errBody?.message?.toLowerCase().includes('number') ||
+                            errBody?.message?.toLowerCase().includes('format')
+      if (!isFormatError) break // not a format issue — don't retry
     }
+  }
 
-    if (chargeStatus === 'success') {
-      // Instantly paid — confirm and thank
-      await confirmPaymentAndUpdate(ref, selected_fees, total_amount, {
-        student_id, student_name, guardian_name, fee_label, email, method: 'mpesa', phone
-      })
-      return {
-        text: `✅ *Payment Successful!*\n\n🎉 *Thank you, ${guardian_name || 'Guardian'}!*\n\n👤 Student: *${student_name}*\n💰 Amount: *KES ${total_amount.toLocaleString()}*\n📋 Fee: *${fee_label}*\n🔑 Ref: *${ref}*\n📱 Method: M-Pesa\n\n📧 Receipt → *${email}*\n\n🙏 Thank you for investing in your child's future!\n\nType *hi* to check remaining fees.`,
-        nextStep: 'welcome',
-        sessionData: {}
-      }
-    }
-
-    // STK push sent (send_otp / pay_offline / pending)
+  if (!chargeRes) {
+    const httpStatus = lastError?.response?.status
+    const errMsg = lastError?.response?.data?.message || lastError?.message || 'Unknown error'
+    console.error(`❌ All phone formats failed. Last error: ${errMsg}`)
     return {
-      text: `📱 *M-Pesa Request Sent!*\n\n✅ A payment prompt has been sent to *${mpesaPhoneDisplay}*\n\n👉 *Check your phone and enter your M-Pesa PIN now.*\n\n💰 Amount: *KES ${total_amount.toLocaleString()}*\n📋 Fee: *${fee_label}*\n🔑 Ref: *${ref}*\n\n⏳ You have *60 seconds* to complete.\n\n_You will receive an automatic confirmation here once payment is done. No further action needed!_ ✅\n\nType *0* for menu if you need to start over.`,
-      nextStep: 'mpesa_confirming',
-      sessionData: {
-        ...session.session_data,
-        mpesa_ref: ref,
-        mpesa_phone: mpesaPhoneDisplay
-      }
-    }
-  } catch (err) {
-    const errMsg = err.response?.data?.message || err.message || 'Unknown error'
-    console.error('M-Pesa STK error:', errMsg, err.response?.data)
-    return {
-      text: `❌ *M-Pesa Failed*\n\n_${errMsg}_\n\nPossible reasons:\n• Phone not registered on M-Pesa\n• Wrong number format\n• Insufficient M-Pesa balance\n\nTry:\n*1* → Enter a different M-Pesa number\n*2* → Pay by card instead\n*0* → Main menu`,
+      text: `❌ *M-Pesa Failed*\n\n_${errMsg}_\n\nTry:\n*1* → Enter a different M-Pesa number\n*2* → Pay by card instead\n*0* → Main menu`,
       nextStep: 'choose_method',
       sessionData: session.session_data
+    }
+  }
+
+  const responseData = chargeRes.data
+
+  if (responseData.status === false) {
+    const errMsg = responseData.message || 'Paystack rejected the request'
+    console.error(`❌ Paystack status=false: ${errMsg}`)
+    return {
+      text: `❌ *M-Pesa Failed*\n\n_${errMsg}_\n\nTry:\n*1* → Enter a different M-Pesa number\n*2* → Pay by card instead\n*0* → Main menu`,
+      nextStep: 'choose_method',
+      sessionData: session.session_data
+    }
+  }
+
+  const chargeStatus = responseData.data?.status
+
+  // Save pending payment records
+  for (const fee of (selected_fees || [])) {
+    await supabase.from('payments').insert({
+      school_id: SCHOOL_ID,
+      student_id,
+      student_fee_id: fee.student_fee_id,
+      amount: Number(fee.balance),
+      payment_method: 'mpesa',
+      paystack_reference: ref,
+      paid_by_email: email,
+      paid_by_name: guardian_name || 'Guardian',
+      paid_by_phone: mpesaPhoneDisplay,
+      status: 'pending'
+    })
+  }
+
+  if (chargeStatus === 'success') {
+    await confirmPaymentAndUpdate(ref, selected_fees, total_amount, {
+      student_id, student_name, guardian_name, fee_label, email, method: 'mpesa', phone
+    })
+    return {
+      text: `✅ *Payment Successful!*\n\n🎉 *Thank you, ${guardian_name || 'Guardian'}!*\n\n👤 Student: *${student_name}*\n💰 Amount: *KES ${total_amount.toLocaleString()}*\n📋 Fee: *${fee_label}*\n🔑 Ref: *${ref}*\n📱 Method: M-Pesa\n\n📧 Receipt → *${email}*\n\n🙏 Thank you for investing in your child's future!\n\nType *hi* to check remaining fees.`,
+      nextStep: 'welcome',
+      sessionData: {}
+    }
+  }
+
+  // STK push sent — pay_offline / send_otp / pending — wait for webhook
+  console.log(`📲 STK push sent. Status from Paystack: ${chargeStatus}`)
+  return {
+    text: `📱 *M-Pesa Request Sent!*\n\n✅ A payment prompt has been sent to *${mpesaPhoneDisplay}*\n\n👉 *Check your phone and enter your M-Pesa PIN now.*\n\n💰 Amount: *KES ${total_amount.toLocaleString()}*\n📋 Fee: *${fee_label}*\n🔑 Ref: *${ref}*\n\n⏳ You have *60 seconds* to complete.\n\n_You will receive an automatic confirmation here once payment is done. No further action needed!_ ✅\n\nType *0* for menu if you need to start over.`,
+    nextStep: 'mpesa_confirming',
+    sessionData: {
+      ...session.session_data,
+      mpesa_ref: ref,
+      mpesa_phone: mpesaPhoneDisplay
     }
   }
 }
@@ -830,6 +866,52 @@ async function resetSession(phone) {
     { onConflict: 'phone_number' }
   )
 }
+
+// ============================================================
+// DEBUG: Test Paystack M-Pesa directly (remove in production)
+// GET /api/test-mpesa?phone=0792881220&amount=10&email=test@test.com
+// ============================================================
+app.get('/api/test-mpesa', async (req, res) => {
+  const rawPhone = req.query.phone || '0712345678'
+  const amount   = parseFloat(req.query.amount || '10')
+  const email    = req.query.email || 'test@schoolpay.co.ke'
+  const phone    = normalizeForPaystack(rawPhone)
+  const ref      = generateRef()
+
+  const payload = {
+    email,
+    amount: Math.round(amount * 100),
+    currency: 'KES',
+    reference: ref,
+    mobile_money: { phone, provider: 'mpesa' }
+  }
+
+  console.log('TEST M-Pesa payload:', JSON.stringify(payload, null, 2))
+  console.log('PAYSTACK_SECRET starts with:', PAYSTACK_SECRET ? PAYSTACK_SECRET.substring(0,10) : 'MISSING')
+
+  try {
+    const r = await axios.post('https://api.paystack.co/charge', payload, {
+      headers: { Authorization: `Bearer ${PAYSTACK_SECRET}`, 'Content-Type': 'application/json' }
+    })
+    res.json({
+      success: true,
+      phone_sent: phone,
+      raw_phone_input: rawPhone,
+      http_status: r.status,
+      paystack_response: r.data
+    })
+  } catch (err) {
+    res.status(500).json({
+      success: false,
+      phone_sent: phone,
+      raw_phone_input: rawPhone,
+      http_status: err.response?.status,
+      paystack_response: err.response?.data,
+      error_message: err.message,
+      secret_key_prefix: PAYSTACK_SECRET ? PAYSTACK_SECRET.substring(0, 10) + '...' : 'MISSING!'
+    })
+  }
+})
 
 app.get('/health', (_, res) => res.json({ status: 'ok', service: 'SchoolPay Bot', time: new Date().toISOString() }))
 
