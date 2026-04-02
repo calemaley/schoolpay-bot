@@ -38,7 +38,7 @@ function normalizeForPaystack(phone) {
   let num = phone.replace(/\D/g, '')
   if (num.startsWith('254')) num = num.slice(3)
   if (num.startsWith('0')) num = num.slice(1)
-  return '254' + num // Paystack wants: 254712345678
+  return '0' + num // Paystack M-Pesa wants local format: 0712345678
 }
 
 function normalizeForWhatsapp(phone) {
