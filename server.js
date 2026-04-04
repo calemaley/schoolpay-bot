@@ -93,6 +93,11 @@ async function handleMessage(session, body, phone) {
   const data = session.session_data || {}
 
   // Reset keywords — always works
+  // Balance check — show remaining fees without restarting
+  if (lower === 'balance') {
+    return await showBalance(data, phone)
+  }
+
   if (['hi','hello','start','menu','0','back','restart'].includes(lower)) {
     await resetSession(phone)
     return welcome()
@@ -116,6 +121,77 @@ async function handleMessage(session, body, phone) {
 // ============================================================
 // STEP HANDLERS
 // ============================================================
+
+// ── SHOW BALANCE ──────────────────────────────────────────────
+async function showBalance(data, phone) {
+  // Try to get student from session first, otherwise ask for admission number
+  const studentId = data.student_id
+
+  if (!studentId) {
+    return {
+      text: `📊 *Check Balance*\n\nEnter the student's *Admission Number* to see remaining fees:\n_(e.g. ADM/2025/001)_`,
+      nextStep: 'ask_admission',
+      sessionData: data
+    }
+  }
+
+  try {
+    const { data: student } = await supabase
+      .from('students')
+      .select('*, classes(name, stream)')
+      .eq('id', studentId)
+      .single()
+
+    const { data: allFees } = await supabase
+      .from('v_student_fee_summary')
+      .select('*')
+      .eq('student_id', studentId)
+      .order('fee_category')
+
+    const outstanding = (allFees || []).filter(f => Number(f.balance) > 0)
+    const cleared = (allFees || []).filter(f => Number(f.balance) <= 0)
+    const cls = student?.classes
+      ? `${student.classes.name}${student.classes.stream ? ' ' + student.classes.stream : ''}`
+      : 'N/A'
+
+    let msg = `📊 *Fee Balance*\n\n👤 *${student?.first_name} ${student?.last_name}*\n🏫 ${cls}\n\n`
+
+    if (outstanding.length === 0) {
+      msg += `✅ *All fees are cleared!*\n\nNo outstanding balance. 🎉`
+    } else {
+      const totalOwed = outstanding.reduce((s, f) => s + Number(f.balance), 0)
+      msg += `*⚠️ Outstanding Fees:*\n`
+      outstanding.forEach((f, i) => {
+        msg += `\n*${i+1}.* ${f.fee_name} — *KES ${Number(f.balance).toLocaleString()}*`
+      })
+      msg += `\n\n💰 *Total Remaining: KES ${totalOwed.toLocaleString()}*`
+
+      if (cleared.length > 0) {
+        msg += `\n\n*✅ Cleared Fees (${cleared.length}):*`
+        cleared.forEach(f => {
+          msg += `\n• ${f.fee_name} ✅`
+        })
+      }
+
+      msg += `\n\n─────────────────`
+      msg += `\nType *hi* to pay now`
+      msg += `\nType *balance* to refresh`
+    }
+
+    return {
+      text: msg,
+      nextStep: 'welcome',
+      sessionData: { student_id: studentId }
+    }
+  } catch (err) {
+    console.error('showBalance error:', err.message)
+    return {
+      text: `❌ Could not load balance. Type *balance* to check fees or *hi* to pay.`,
+      nextStep: 'welcome',
+      sessionData: {}
+    }
+  }
+}
 
 function welcome() {
   return {
@@ -175,7 +251,7 @@ async function askAdmission(data, body) {
 
   if (!outstanding.length) {
     return {
-      text: `✅ *All fees cleared!*\n\n👤 *${student.first_name} ${student.last_name}*\n🏫 ${cls}\n\nNo outstanding fees. Thank you! 🎉\n\nType *hi* to start again.`,
+      text: `✅ *All fees cleared!*\n\n👤 *${student.first_name} ${student.last_name}*\n🏫 ${cls}\n\nNo outstanding fees. Thank you! 🎉\n\nType *balance* to check fees or *hi* to pay.`,
       nextStep: 'welcome',
       sessionData: {}
     }
@@ -340,7 +416,7 @@ async function doMpesa(data, body, phone) {
     if (status === 'success') {
       await confirmAndUpdate(ref, data)
       return {
-        text: `✅ *Payment Successful!*\n\n🎉 KES ${Number(data.total_amount).toLocaleString()} received!\n📧 Receipt sent to ${data.email}\n🙏 Thank you!\n\nType *hi* to check other fees.`,
+        text: `✅ *Payment Successful!*\n\n🎉 KES ${Number(data.total_amount).toLocaleString()} received!\n📧 Receipt sent to ${data.email}\n🙏 Thank you!\n\nType *balance* to see remaining fees or *hi* to pay again.`,
         nextStep: 'welcome',
         sessionData: {}
       }
@@ -446,7 +522,7 @@ async function cardCvv(data, body, phone) {
     if (status === 'success') {
       await confirmAndUpdate(ref, data)
       return {
-        text: `✅ *Card Payment Successful!*\n\n🎉 Dear ${data.guardian_name}!\n\n👤 *${data.student_name}*\n💰 *KES ${Number(data.total_amount).toLocaleString()}*\n📋 ${data.fee_label}\n🔑 Ref: ${ref}\n\n📧 Receipt → ${data.email}\n🙏 Thank you!\n\nType *hi* to check other fees.`,
+        text: `✅ *Card Payment Successful!*\n\n🎉 Dear ${data.guardian_name}!\n\n👤 *${data.student_name}*\n💰 *KES ${Number(data.total_amount).toLocaleString()}*\n📋 ${data.fee_label}\n🔑 Ref: ${ref}\n\n📧 Receipt → ${data.email}\n🙏 Thank you!\n\nType *balance* to see remaining fees or *hi* to pay again.`,
         nextStep: 'welcome',
         sessionData: {}
       }
@@ -514,7 +590,7 @@ app.post('/webhook/paystack-confirm', async (req, res) => {
         const wa = toWhatsappPhone(rawPhone)
         console.log('[WEBHOOK] Sending confirmation to:', wa)
         await sendWA(wa,
-          `✅ *Payment Confirmed!*\n\n🎉 Dear ${metadata?.guardian_name || 'Guardian'},\n\n👤 Student: *${metadata?.student_name}*\n💰 Amount: *KES ${paid.toLocaleString()}*\n📋 Fee: *${metadata?.fee_label || 'School Fees'}*\n🔑 Ref: *${reference}*\n\n📧 Receipt → *${customer.email}*\n\n🙏 Thank you for investing in your child's education!\n\nType *hi* to check remaining fees.`
+          `✅ *Payment Confirmed!*\n\n🎉 Dear ${metadata?.guardian_name || 'Guardian'},\n\n👤 Student: *${metadata?.student_name}*\n💰 Amount: *KES ${paid.toLocaleString()}*\n📋 Fee: *${metadata?.fee_label || 'School Fees'}*\n🔑 Ref: *${reference}*\n\n📧 Receipt → *${customer.email}*\n\n🙏 Thank you for investing in your child's education!\n\nType *balance* to see remaining fees or *hi* to pay again.`
         )
       }
     }
@@ -565,7 +641,7 @@ app.post('/api/send-reminder', async (req, res) => {
     console.log(`[REMINDER] ${student.first_name} ${student.last_name} → ${wa}`)
 
     await sendWA(wa,
-      `🔔 *Payment Reminder*\n\nDear *${student.guardian1_name}*,\n\nOutstanding fees for *${student.first_name} ${student.last_name}* (${cls}):\n\n${lines}\n\n💰 *Total: KES ${total.toLocaleString()}*\n\nTo pay, WhatsApp us and type *hi* 😊\n\nThank you! 🙏`
+      `🔔 *Payment Reminder*\n\nDear *${student.guardian1_name}*,\n\nOutstanding fees for *${student.first_name} ${student.last_name}* (${cls}):\n\n${lines}\n\n💰 *Total: KES ${total.toLocaleString()}*\n\nTo pay, WhatsApp us and type *hi* to pay or *balance* to check fees 😊\n\nThank you! 🙏`
     )
 
     res.json({ success: true, sent_to: wa, student: `${student.first_name} ${student.last_name}`, total })
@@ -604,7 +680,7 @@ app.post('/api/send-reminders', async (req, res) => {
       const total = sd.fees.reduce((s, f) => s + Number(f.balance), 0)
 
       await sendWA(wa,
-        `🔔 *Payment Reminder*\n\nDear *${s.guardian1_name}*,\n\nOutstanding fees for *${sd.name}*:\n\n${lines}\n\n💰 *Total: KES ${total.toLocaleString()}*\n\nType *hi* here to pay now 😊\n\n🙏 Thank you!`
+        `🔔 *Payment Reminder*\n\nDear *${s.guardian1_name}*,\n\nOutstanding fees for *${sd.name}*:\n\n${lines}\n\n💰 *Total: KES ${total.toLocaleString()}*\n\nType *hi* to pay or *balance* to check fees 😊\n\n🙏 Thank you!`
       )
       sent++
       await new Promise(r => setTimeout(r, 700))
