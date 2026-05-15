@@ -376,40 +376,71 @@ async function handleUSSD(sessionId, phone, parts) {
           .eq('school_id', SCHOOL_ID).ilike('admission_number', admission).eq('is_active', true).single()
         student = s
       } catch (e) {}
-      if (!student) return `END Student "${admission}" not found.`
+      if (!student) return `END Student "${admission}" not found.\nCheck number and try again.`
 
-      const year = new Date().getFullYear()
-      const { data: results } = await supabase.from('student_results')
-        .select('subject, exam_type, marks_scored, total_marks, term')
-        .eq('student_id', student.id).eq('year', year)
-        .order('subject')
+      const { data: available } = await supabase.from('student_results')
+        .select('year, term').eq('student_id', student.id)
+        .order('year', { ascending: false }).order('term')
 
-      if (!results || !results.length) return `END ${student.first_name} ${student.last_name}\nNo results found for ${year}.\n\nText results to get full report.`
+      if (!available || !available.length) return `END ${student.first_name} ${student.last_name}\nNo results recorded yet.\n\nText results for full report.`
 
-      // Group by subject, calculate averages
+      const seen = new Set(), periods = []
+      available.forEach(r => { const k=`${r.year}-${r.term}`; if(!seen.has(k)){seen.add(k);periods.push(r)} })
+
+      await saveUssdSession(sessionId, {
+        student_id: student.id,
+        student_name: `${student.first_name} ${student.last_name}`,
+        periods
+      })
+
+      let msg = `CON ${student.first_name} ${student.last_name}\nSelect period:\n`
+      periods.slice(0, 5).forEach((pr, i) => { msg += `${i+1}. ${pr.year} Term ${pr.term}\n` })
+      msg += `${Math.min(periods.length,5)+1}. All periods`
+      return msg
+    }
+
+    if (depth === 3) {
+      const pick = parseInt(p(2))
+      const ussdData = await getUssdSession(sessionId)
+      const periods = ussdData.periods || []
+      const allChoice = Math.min(periods.length, 5) + 1
+
+      let filterYear = null, filterTerm = null
+      if (pick !== allChoice && pick >= 1 && pick <= periods.length) {
+        filterYear = periods[pick - 1].year
+        filterTerm = periods[pick - 1].term
+      }
+
+      let resQuery = supabase.from('student_results')
+        .select('subject, marks_scored, total_marks')
+        .eq('student_id', ussdData.student_id)
+      if (filterYear) resQuery = resQuery.eq('year', filterYear)
+      if (filterTerm) resQuery = resQuery.eq('term', filterTerm)
+      const { data: res } = await resQuery
+
+      if (!res || !res.length) return `END No results found.\nText results for full report.`
+
       const bySubj = {}
-      results.forEach(r => {
+      res.forEach(r => {
         if (!bySubj[r.subject]) bySubj[r.subject] = []
         bySubj[r.subject].push(Math.round((r.marks_scored / r.total_marks) * 100))
       })
 
-      const cls = student.classes ? `${student.classes.name}${student.classes.stream ? ' ' + student.classes.stream : ''}` : ''
-      let msg = `END ${student.first_name} ${student.last_name}${cls ? ' - ' + cls : ''}\n${year} Results:\n\n`
-
+      const label = filterYear ? `${filterYear} T${filterTerm}` : 'All'
+      let msg = `END ${ussdData.student_name}\n${label} Results:\n\n`
       const allAvgs = []
       Object.entries(bySubj).forEach(([subj, pcts]) => {
         const avg = Math.round(pcts.reduce((a, b) => a + b, 0) / pcts.length)
         const gr = gradeLabel(avg)
-        const short = subj.length > 12 ? subj.substring(0, 12) + '.' : subj
+        const short = subj.length > 10 ? subj.substring(0, 10) + '.' : subj
         msg += `${short}: ${avg}% ${gr}\n`
         allAvgs.push(avg)
       })
-
       if (allAvgs.length) {
         const overall = Math.round(allAvgs.reduce((a, b) => a + b, 0) / allAvgs.length)
         msg += `\nOverall: ${overall}% ${gradeLabel(overall)}`
       }
-      msg += `\n\nText results for full breakdown.`
+      msg += `\n\nText results for full report.`
       return msg
     }
   }
@@ -496,6 +527,7 @@ async function handleMessage(session, body, phone) {
     case 'card_expiry':     result = cardExpiry(data, body); break
     case 'card_cvv':            result = await cardCvv(data, body, phone); break
     case 'ask_results_adm':     result = await handleResultsAdmission(data, body); break
+    case 'pick_results_period': result = await handleResultsPeriod(data, body); break
     default:                    result = welcome()
   }
 
@@ -591,12 +623,12 @@ const EXAM_LABELS = { cat: 'CAT', opener: 'Opener', quiz: 'Quiz', midterm: 'Midt
 async function showResults(data, phone) {
   if (!data.student_id) {
     return {
-      text: `📊 *Academic Results*\n\nEnter the student's *Admission Number*:\n_(e.g. ADM/2025/001)_\n\n_*0* back | *6* menu_`,
+      text: `📊 *Academic Results*\n━━━━━━━━━━━━━━━━━━━━\n\nPlease enter the student's *Admission Number*:\n\n  🎓 _(e.g. ADM/2025/001)_\n\n_*0* back · *6* menu_`,
       nextStep: 'ask_results_adm',
       sessionData: data
     }
   }
-  return await fetchResults(data.student_id)
+  return await buildPeriodPicker(data.student_id, data)
 }
 
 async function handleResultsAdmission(data, body) {
@@ -610,72 +642,169 @@ async function handleResultsAdmission(data, body) {
 
   if (!student) {
     return {
-      text: `❌ Student *${body.trim()}* not found.\n\nCheck the admission number and try again.\n_*0* back | *6* menu_`,
+      text: `❌ *Student Not Found*\n\n"${body.trim()}" does not match any student record.\nPlease check and try again.\n\n  🎓 _(e.g. ADM/2025/001)_\n\n_*0* back · *6* menu_`,
       nextStep: 'ask_results_adm',
       sessionData: data
     }
   }
-  return await fetchResults(student.id)
+  const cls = student.classes
+    ? `${student.classes.name}${student.classes.stream ? ' ' + student.classes.stream : ''}`
+    : ''
+  return await buildPeriodPicker(student.id, {
+    ...data,
+    results_student_name: `${student.first_name} ${student.last_name}`,
+    results_student_class: cls
+  })
 }
 
-async function fetchResults(studentId) {
+// Shows available years & terms for the student to pick from
+async function buildPeriodPicker(studentId, data) {
+  try {
+    const { data: available } = await supabase.from('student_results')
+      .select('year, term')
+      .eq('student_id', studentId)
+      .order('year', { ascending: false })
+      .order('term')
+
+    if (!available || available.length === 0) {
+      return {
+        text: `📊 *Academic Results*\n━━━━━━━━━━━━━━━━━━━━\n\n  👤 *${data.results_student_name || 'Student'}*\n\nNo results have been recorded yet.\nResults are uploaded by teachers after each examination.\n\n_Type *balance* for fees · *hi* for menu_`,
+        nextStep: 'welcome',
+        sessionData: { student_id: studentId }
+      }
+    }
+
+    // Build unique year+term periods
+    const seen = new Set()
+    const periods = []
+    available.forEach(r => {
+      const key = `${r.year}-${r.term}`
+      if (!seen.has(key)) { seen.add(key); periods.push({ year: r.year, term: r.term }) }
+    })
+
+    const name = data.results_student_name || 'Student'
+    const cls  = data.results_student_class ? `  🏫 ${data.results_student_class}\n` : ''
+
+    let msg = `📊 *Academic Results*\n━━━━━━━━━━━━━━━━━━━━\n\n`
+    msg += `  👤 *${name}*\n${cls}\n`
+    msg += `Select the period you want to view:\n\n`
+    periods.forEach((p, i) => {
+      msg += `  *${i + 1}.* Year *${p.year}* — Term *${p.term}*\n`
+    })
+    msg += `  *${periods.length + 1}.* All years & terms\n`
+    msg += `\n━━━━━━━━━━━━━━━━━━━━\n`
+    msg += `_Type a number · *0* back · *6* menu_`
+
+    return {
+      text: msg,
+      nextStep: 'pick_results_period',
+      sessionData: { ...data, results_student_id: studentId, results_periods: periods }
+    }
+  } catch (err) {
+    console.error('buildPeriodPicker error:', err.message)
+    return { text: `❌ Could not load results. Type *results* to retry.`, nextStep: 'welcome', sessionData: {} }
+  }
+}
+
+async function handleResultsPeriod(data, body) {
+  const periods = data.results_periods || []
+  const studentId = data.results_student_id || data.student_id
+  const input = body.trim()
+
+  // All years & terms
+  if (parseInt(input) === periods.length + 1 || input.toUpperCase() === 'ALL') {
+    return await fetchResults(studentId, null, null, data)
+  }
+
+  const idx = parseInt(input) - 1
+  if (isNaN(idx) || idx < 0 || idx >= periods.length) {
+    return {
+      text: `❌ Please type a number between *1 and ${periods.length + 1}*.\n\n_*0* back · *6* menu_`,
+      nextStep: 'pick_results_period',
+      sessionData: data
+    }
+  }
+
+  const period = periods[idx]
+  return await fetchResults(studentId, period.year, period.term, data)
+}
+
+async function fetchResults(studentId, filterYear = null, filterTerm = null, sessionData = {}) {
   try {
     const { data: student } = await supabase.from('students')
       .select('first_name, last_name, classes(name, stream)').eq('id', studentId).single()
 
-    const year = new Date().getFullYear()
-    const { data: results } = await supabase.from('student_results')
+    let query = supabase.from('student_results')
       .select('subject, exam_type, marks_scored, total_marks, term, year')
-      .eq('student_id', studentId).eq('year', year)
-      .order('term').order('subject').order('exam_type')
+      .eq('student_id', studentId)
+      .order('year', { ascending: false })
+      .order('term')
+      .order('subject')
+      .order('exam_type')
+
+    if (filterYear)  query = query.eq('year', filterYear)
+    if (filterTerm)  query = query.eq('term', filterTerm)
+
+    const { data: results } = await query
 
     const cls = student?.classes
       ? `${student.classes.name}${student.classes.stream ? ' ' + student.classes.stream : ''}`
       : ''
     const name = `${student?.first_name} ${student?.last_name}`
 
+    const periodLabel = filterYear
+      ? (filterTerm ? `${filterYear} — Term ${filterTerm}` : `Year ${filterYear} (All Terms)`)
+      : 'All Years'
+
     if (!results || results.length === 0) {
       return {
-        text: `📊 *Academic Results — ${year}*\n━━━━━━━━━━━━━━━━━━━━\n\n  👤 *${name}*${cls ? `\n  🏫 ${cls}` : ''}\n\n━━━━━━━━━━━━━━━━━━━━\nNo results have been recorded for ${year} yet.\n\nResults are uploaded by the school's teachers after each examination.\n\n_Type *balance* for fees · *hi* for menu_`,
+        text: `📊 *Academic Results — ${periodLabel}*\n━━━━━━━━━━━━━━━━━━━━\n\n  👤 *${name}*${cls ? `\n  🏫 ${cls}` : ''}\n\n━━━━━━━━━━━━━━━━━━━━\nNo results found for *${periodLabel}*.\n\n_Type *results* to pick a different period · *hi* for menu_`,
         nextStep: 'welcome',
         sessionData: { student_id: studentId }
       }
     }
 
-    // Group by term → subject → exams
-    const byTerm = {}
+    // Group by year → term → subject → exams
+    const byYear = {}
     results.forEach(r => {
+      if (!byYear[r.year]) byYear[r.year] = {}
       const tk = `Term ${r.term}`
-      if (!byTerm[tk]) byTerm[tk] = {}
-      if (!byTerm[tk][r.subject]) byTerm[tk][r.subject] = []
-      byTerm[tk][r.subject].push(r)
+      if (!byYear[r.year][tk]) byYear[r.year][tk] = {}
+      if (!byYear[r.year][tk][r.subject]) byYear[r.year][tk][r.subject] = []
+      byYear[r.year][tk][r.subject].push(r)
     })
 
-    let msg = `📊 *Academic Results — ${year}*\n`
+    let msg = `📊 *Academic Results — ${periodLabel}*\n`
     msg += `━━━━━━━━━━━━━━━━━━━━\n\n`
     msg += `  👤 *${name}*\n`
     if (cls) msg += `  🏫 ${cls}\n`
     const allPcts = []
 
-    Object.entries(byTerm).forEach(([termLabel, subjects]) => {
-      msg += `\n━━━━━━━━━━━━━━━━━━━━\n`
-      msg += `📅 *${termLabel}*\n`
+    Object.entries(byYear).sort((a, b) => b[0] - a[0]).forEach(([year, terms]) => {
+      if (!filterYear) {
+        msg += `\n━━━━━━━━━━━━━━━━━━━━\n`
+        msg += `📅 *Year ${year}*\n`
+      }
+      Object.entries(terms).sort().forEach(([termLabel, subjects]) => {
+        msg += `\n━━━━━━━━━━━━━━━━━━━━\n`
+        msg += filterYear ? `📅 *${termLabel}*\n` : `  📅 *${termLabel}*\n`
 
-      Object.entries(subjects).forEach(([subject, exams]) => {
-        msg += `\n  📚 *${subject}*\n`
-        let subSum = 0, subCount = 0
-        exams.forEach(e => {
-          const pct = Math.round((e.marks_scored / e.total_marks) * 100)
-          const gr = gradeLabel(pct)
-          const label = EXAM_LABELS[e.exam_type] || e.exam_type
-          const padLabel = label.padEnd(12, ' ')
-          msg += `    ${padLabel} ${e.marks_scored}/${e.total_marks}  →  *${pct}%  ${gr}*\n`
-          subSum += pct; subCount++; allPcts.push(pct)
+        Object.entries(subjects).sort().forEach(([subject, exams]) => {
+          msg += `\n  📚 *${subject}*\n`
+          let subSum = 0, subCount = 0
+          exams.forEach(e => {
+            const pct = Math.round((e.marks_scored / e.total_marks) * 100)
+            const gr = gradeLabel(pct)
+            const label = EXAM_LABELS[e.exam_type] || e.exam_type
+            const padLabel = label.padEnd(12, ' ')
+            msg += `    ${padLabel} ${e.marks_scored}/${e.total_marks}  →  *${pct}%  ${gr}*\n`
+            subSum += pct; subCount++; allPcts.push(pct)
+          })
+          if (subCount > 1) {
+            const avg = Math.round(subSum / subCount)
+            msg += `    _Subject Avg: ${avg}% — ${gradeLabel(avg)} (${gradeRemark(avg)})_\n`
+          }
         })
-        if (subCount > 1) {
-          const avg = Math.round(subSum / subCount)
-          msg += `    _Subject Avg: ${avg}% — ${gradeLabel(avg)} (${gradeRemark(avg)})_\n`
-        }
       })
     })
 
@@ -688,7 +817,7 @@ async function fetchResults(studentId) {
       msg += `━━━━━━━━━━━━━━━━━━━━`
     }
 
-    msg += `\n\n_Type *balance* for fees · *hi* to pay · *results* to refresh_`
+    msg += `\n\n_Type *results* to view another period · *balance* for fees · *hi* for menu_`
 
     return {
       text: msg,
