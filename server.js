@@ -1,9 +1,10 @@
 // ============================================================
-// SCHOOLPAY WHATSAPP BOT - Fixed & Stable
+// SCHOOLPAY BOT — Twilio (WhatsApp) + Africa's Talking (SMS + USSD)
 // ============================================================
 const express = require('express')
 const { createClient } = require('@supabase/supabase-js')
 const twilio = require('twilio')
+const AfricasTalking = require('africastalking')
 const axios = require('axios')
 const crypto = require('crypto')
 require('dotenv').config()
@@ -25,28 +26,37 @@ const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_KEY
 )
+
+// Twilio — WhatsApp
 const twilioClient = twilio(
   process.env.TWILIO_ACCOUNT_SID,
   process.env.TWILIO_AUTH_TOKEN
 )
 const MessagingResponse = twilio.twiml.MessagingResponse
+const BOT_NUMBER = `whatsapp:${process.env.TWILIO_WHATSAPP_NUMBER}`
+
+// Africa's Talking — SMS + USSD
+const AT = AfricasTalking({
+  username: process.env.AT_USERNAME || 'sandbox',
+  apiKey: process.env.AT_API_KEY
+})
+const atSMS = AT.SMS
+const AT_SENDER = process.env.AT_SENDER_ID || 'SchoolPay'
+
 const SCHOOL_ID = process.env.SCHOOL_ID
 const PAYSTACK_SECRET = process.env.PAYSTACK_SECRET_KEY
-const BOT_NUMBER = `whatsapp:${process.env.TWILIO_WHATSAPP_NUMBER}`
 
 // ============================================================
 // PHONE HELPERS
 // ============================================================
 function toPaystackPhone(raw) {
-  // Paystack wants +254XXXXXXXXX (WITH + sign for Kenya)
   let n = raw.replace(/\D/g, '')
   if (n.startsWith('254')) n = n.slice(3)
   if (n.startsWith('0')) n = n.slice(1)
   return '+254' + n
 }
 
-function toWhatsappPhone(raw) {
-  // Twilio wants +254XXXXXXXXX
+function toE164(raw) {
   let n = raw.replace(/\D/g, '')
   if (n.startsWith('254')) n = n.slice(3)
   if (n.startsWith('0')) n = n.slice(1)
@@ -54,20 +64,42 @@ function toWhatsappPhone(raw) {
 }
 
 function generateRef() {
-  return `SCH-${Date.now()}-${Math.random().toString(36).substr(2,5).toUpperCase()}`
+  return `SCH-${Date.now()}-${Math.random().toString(36).substr(2, 5).toUpperCase()}`
 }
 
 // ============================================================
-// WHATSAPP WEBHOOK
+// SEND HELPERS
+// ============================================================
+async function sendWA(phone, message) {
+  try {
+    const to = `whatsapp:${toE164(phone)}`
+    console.log(`[WA] Sending to ${to}`)
+    const r = await twilioClient.messages.create({ from: BOT_NUMBER, to, body: message })
+    console.log(`[WA] ✅ Sent SID: ${r.sid}`)
+  } catch (err) {
+    console.error(`[WA] ❌ Failed to ${phone}:`, err.message)
+  }
+}
+
+async function sendSMS(phone, message) {
+  try {
+    const to = toE164(phone)
+    console.log(`[SMS] Sending to ${to}`)
+    const result = await atSMS.send({ to: [to], message, from: AT_SENDER })
+    console.log(`[SMS] ✅ Result:`, JSON.stringify(result))
+  } catch (err) {
+    console.error(`[SMS] ❌ Failed to ${phone}:`, err.message)
+  }
+}
+
+// ============================================================
+// WHATSAPP WEBHOOK (Twilio — unchanged)
 // ============================================================
 app.post('/webhook/whatsapp', async (req, res) => {
-  // Always respond to Twilio immediately
   const twiml = new MessagingResponse()
-
   const from = req.body.From || ''
   const body = (req.body.Body || '').trim()
   const phone = from.replace('whatsapp:', '')
-
   let replyText = '❌ Error. Type *hi* to restart.'
 
   try {
@@ -76,7 +108,7 @@ app.post('/webhook/whatsapp', async (req, res) => {
     await updateSession(phone, reply.nextStep, reply.sessionData || {})
     replyText = reply.text
   } catch (err) {
-    console.error('Bot error:', err.message, err.stack)
+    console.error('WA Bot error:', err.message, err.stack)
   }
 
   twiml.message(replyText)
@@ -85,20 +117,323 @@ app.post('/webhook/whatsapp', async (req, res) => {
 })
 
 // ============================================================
-// MESSAGE HANDLER
+// SMS INCOMING WEBHOOK (Africa's Talking)
+// ============================================================
+app.post('/webhook/sms', async (req, res) => {
+  res.sendStatus(200)
+
+  const from = req.body.from || ''
+  const body = (req.body.text || '').trim()
+  const phone = toE164(from)
+
+  console.log(`[SMS IN] From: ${phone} | Text: ${body}`)
+
+  try {
+    const session = await getSession(phone)
+    const reply = await handleMessage(session, body, phone)
+    await updateSession(phone, reply.nextStep, reply.sessionData || {})
+    await sendSMS(phone, reply.text)
+  } catch (err) {
+    console.error('SMS Bot error:', err.message, err.stack)
+    await sendSMS(phone, 'Error. Text hi to restart.')
+  }
+})
+
+// ============================================================
+// SMS DELIVERY REPORT WEBHOOK (Africa's Talking)
+// ============================================================
+app.post('/webhook/delivery', (req, res) => {
+  console.log('[DELIVERY]', req.body)
+  res.sendStatus(200)
+})
+
+// ============================================================
+// USSD WEBHOOK (Africa's Talking)
+// ============================================================
+app.post('/webhook/ussd', async (req, res) => {
+  const { sessionId, phoneNumber, text } = req.body
+  const phone = toE164(phoneNumber)
+  const parts = text ? text.split('*') : []
+
+  console.log(`[USSD] ${phone} | text: "${text}"`)
+
+  let response = ''
+  try {
+    response = await handleUSSD(sessionId, phone, parts)
+  } catch (err) {
+    console.error('[USSD] Error:', err.message)
+    response = 'END Service error. Please try again.'
+  }
+
+  res.set('Content-Type', 'text/plain')
+  res.send(response)
+})
+
+// ============================================================
+// USSD FLOW
+// ============================================================
+async function handleUSSD(sessionId, phone, parts) {
+  const depth = parts.length
+  const p = (i) => parts[i] || ''
+
+  // Main menu
+  if (depth === 0 || (depth === 1 && p(0) === '')) {
+    return 'CON Welcome to SchoolPay\n1. Pay Fees\n2. Check Balance\n0. Exit'
+  }
+
+  const choice = p(0)
+
+  if (choice === '0') return 'END Thank you for using SchoolPay!'
+
+  // ── PAY FEES ─────────────────────────────────────────────
+  if (choice === '1') {
+    if (depth === 1) return 'CON Enter admission number:'
+
+    const admission = p(1)
+
+    // Look up student
+    if (depth === 2) {
+      let student = null
+      try {
+        const { data: s } = await supabase
+          .from('students')
+          .select('*, classes(name, stream)')
+          .eq('school_id', SCHOOL_ID)
+          .ilike('admission_number', admission)
+          .eq('is_active', true)
+          .single()
+        student = s
+      } catch (e) {}
+
+      if (!student) return `END Student "${admission}" not found.\nCheck number and try again.`
+
+      const { data: allFees } = await supabase
+        .from('v_student_fee_summary')
+        .select('*')
+        .eq('student_id', student.id)
+        .order('fee_category')
+
+      const outstanding = (allFees || []).filter(f => Number(f.balance) > 0)
+
+      if (!outstanding.length) {
+        return `END All fees cleared!\n${student.first_name} ${student.last_name}\nhas no outstanding fees.`
+      }
+
+      const total = outstanding.reduce((s, f) => s + Number(f.balance), 0)
+
+      await saveUssdSession(sessionId, {
+        student_id: student.id,
+        student_name: `${student.first_name} ${student.last_name}`,
+        guardian_name: student.guardian1_name || 'Guardian',
+        fees: outstanding
+      })
+
+      let msg = `CON ${student.first_name} ${student.last_name}\nOwed: KES ${total.toLocaleString()}\n`
+      outstanding.slice(0, 5).forEach((f, i) => {
+        const name = f.fee_name.length > 14 ? f.fee_name.substring(0, 14) + '.' : f.fee_name
+        msg += `${i + 1}. ${name}: ${Number(f.balance).toLocaleString()}\n`
+      })
+      msg += `0. Pay All`
+      return msg
+    }
+
+    // Fee selected
+    if (depth === 3) {
+      const feeChoice = p(2)
+      const ussdData = await getUssdSession(sessionId)
+      const fees = ussdData.fees || []
+
+      let selectedFees = []
+      let total = 0
+      let label = ''
+
+      if (feeChoice === '0') {
+        selectedFees = fees
+        total = fees.reduce((s, f) => s + Number(f.balance), 0)
+        label = 'All Outstanding Fees'
+      } else {
+        const idx = parseInt(feeChoice) - 1
+        if (isNaN(idx) || idx < 0 || idx >= fees.length) {
+          return `CON Invalid choice.\nEnter 1-${fees.length} or 0 for All:`
+        }
+        selectedFees = [fees[idx]]
+        total = Number(fees[idx].balance)
+        label = fees[idx].fee_name
+      }
+
+      await saveUssdSession(sessionId, { ...ussdData, selected_fees: selectedFees, total_amount: total, fee_label: label })
+      return `CON ${label}\nKES ${total.toLocaleString()}\n\n1. M-Pesa STK Push\n2. Bank Transfer\n0. Back`
+    }
+
+    // Payment method selected
+    if (depth === 4) {
+      const methodChoice = p(3)
+      const ussdData = await getUssdSession(sessionId)
+
+      if (methodChoice === '1') return 'CON Enter M-Pesa number:\n(e.g. 0712345678)'
+
+      if (methodChoice === '2') {
+        const ref = generateRef()
+        await savePendingUSSD(ussdData, ref, 'bank')
+        return `END Bank Transfer\nKES ${Number(ussdData.total_amount).toLocaleString()}\n\nBank: Equity Bank\nAcc: 0123456789\nRef: ${ref}\n\nUse ref as payment reference.`
+      }
+
+      return 'CON Choose:\n1. M-Pesa\n2. Bank Transfer'
+    }
+
+    // M-Pesa phone entered
+    if (depth === 5) {
+      const methodChoice = p(3)
+      const mpesaPhone = p(4)
+      const ussdData = await getUssdSession(sessionId)
+
+      if (methodChoice === '1') {
+        const digits = mpesaPhone.replace(/\D/g, '')
+        if (digits.length < 9 || digits.length > 12) {
+          return 'CON Invalid number.\nEnter M-Pesa number:\n(e.g. 0712345678)'
+        }
+
+        const paystackPhone = toPaystackPhone(mpesaPhone)
+        const ref = generateRef()
+
+        try {
+          await axios.post(
+            'https://api.paystack.co/charge',
+            {
+              email: `ussd-${phone.replace(/\D/g, '')}@schoolpay.ke`,
+              amount: Math.round(Number(ussdData.total_amount) * 100),
+              currency: 'KES',
+              reference: ref,
+              mobile_money: { phone: paystackPhone, provider: 'mpesa' },
+              metadata: {
+                school_id: SCHOOL_ID,
+                student_id: ussdData.student_id,
+                student_name: ussdData.student_name,
+                guardian_name: ussdData.guardian_name,
+                fee_label: ussdData.fee_label,
+                fee_ids: (ussdData.selected_fees || []).map(f => f.student_fee_id).join(','),
+                guardian_phone: phone,
+                channel: 'ussd_mpesa'
+              }
+            },
+            { headers: { Authorization: `Bearer ${PAYSTACK_SECRET}`, 'Content-Type': 'application/json' } }
+          )
+
+          await savePendingUSSD(ussdData, ref, 'mpesa')
+          return `END STK Push Sent!\n\nCheck ${paystackPhone}\nfor M-Pesa PIN prompt.\n\nKES ${Number(ussdData.total_amount).toLocaleString()}\nRef: ${ref}\n\nYou will receive SMS confirmation.`
+        } catch (err) {
+          const msg = err.response?.data?.message || 'Payment failed'
+          console.error('[USSD MPESA] Error:', msg)
+          return `END M-Pesa failed:\n${msg}\n\nDial again to retry.`
+        }
+      }
+    }
+  }
+
+  // ── CHECK BALANCE ────────────────────────────────────────
+  if (choice === '2') {
+    if (depth === 1) return 'CON Enter admission number:'
+
+    if (depth === 2) {
+      const admission = p(1)
+      let student = null
+      try {
+        const { data: s } = await supabase
+          .from('students')
+          .select('*, classes(name, stream)')
+          .eq('school_id', SCHOOL_ID)
+          .ilike('admission_number', admission)
+          .eq('is_active', true)
+          .single()
+        student = s
+      } catch (e) {}
+
+      if (!student) return `END Student "${admission}" not found.`
+
+      const { data: allFees } = await supabase
+        .from('v_student_fee_summary')
+        .select('*')
+        .eq('student_id', student.id)
+        .order('fee_category')
+
+      const outstanding = (allFees || []).filter(f => Number(f.balance) > 0)
+
+      if (!outstanding.length) {
+        return `END ${student.first_name} ${student.last_name}\nAll fees cleared!`
+      }
+
+      const total = outstanding.reduce((s, f) => s + Number(f.balance), 0)
+      let msg = `END ${student.first_name} ${student.last_name}\nOwed: KES ${total.toLocaleString()}\n`
+      outstanding.slice(0, 5).forEach(f => {
+        const name = f.fee_name.length > 14 ? f.fee_name.substring(0, 14) + '.' : f.fee_name
+        msg += `${name}: KES ${Number(f.balance).toLocaleString()}\n`
+      })
+      msg += `\nText hi to pay via SMS`
+      return msg
+    }
+  }
+
+  return 'END Invalid option. Please try again.'
+}
+
+// ============================================================
+// USSD SESSION HELPERS
+// ============================================================
+async function saveUssdSession(sessionId, data) {
+  try {
+    await supabase.from('ussd_sessions').upsert(
+      { session_id: sessionId, session_data: data, updated_at: new Date().toISOString() },
+      { onConflict: 'session_id' }
+    )
+  } catch (err) {
+    console.error('saveUssdSession error:', err.message)
+  }
+}
+
+async function getUssdSession(sessionId) {
+  try {
+    const { data } = await supabase
+      .from('ussd_sessions')
+      .select('session_data')
+      .eq('session_id', sessionId)
+      .single()
+    return data?.session_data || {}
+  } catch (err) {
+    console.error('getUssdSession error:', err.message)
+    return {}
+  }
+}
+
+async function savePendingUSSD(ussdData, ref, method) {
+  for (const fee of (ussdData.selected_fees || [])) {
+    try {
+      await supabase.from('payments').insert({
+        school_id: SCHOOL_ID,
+        student_id: ussdData.student_id,
+        student_fee_id: fee.student_fee_id,
+        amount: Number(fee.balance),
+        payment_method: method,
+        paystack_reference: ref,
+        paid_by_name: ussdData.guardian_name || 'Guardian',
+        status: 'pending'
+      })
+    } catch (e) {
+      console.error('savePendingUSSD error:', e.message)
+    }
+  }
+}
+
+// ============================================================
+// MESSAGE HANDLER (shared by WhatsApp + SMS)
 // ============================================================
 async function handleMessage(session, body, phone) {
   const lower = body.toLowerCase().trim()
   const step = session.current_step || 'welcome'
   const data = session.session_data || {}
 
-  // Reset keywords — always works
-  // Balance check — show remaining fees without restarting
-  if (lower === 'balance') {
-    return await showBalance(data, phone)
-  }
+  if (lower === 'balance') return await showBalance(data, phone)
 
-  if (['hi','hello','start','menu','0','back','restart'].includes(lower)) {
+  if (['hi', 'hello', 'start', 'menu', '0', 'back', 'restart'].includes(lower)) {
     await resetSession(phone)
     return welcome()
   }
@@ -113,20 +448,15 @@ async function handleMessage(session, body, phone) {
     case 'card_number':     return cardNumber(data, body)
     case 'card_expiry':     return cardExpiry(data, body)
     case 'card_cvv':        return cardCvv(data, body, phone)
-    default:
-      return welcome()
+    default:                return welcome()
   }
 }
 
 // ============================================================
 // STEP HANDLERS
 // ============================================================
-
-// ── SHOW BALANCE ──────────────────────────────────────────────
 async function showBalance(data, phone) {
-  // Try to get student from session first, otherwise ask for admission number
   const studentId = data.student_id
-
   if (!studentId) {
     return {
       text: `📊 *Check Balance*\n\nEnter the student's *Admission Number* to see remaining fees:\n_(e.g. ADM/2025/001)_`,
@@ -162,27 +492,17 @@ async function showBalance(data, phone) {
       const totalOwed = outstanding.reduce((s, f) => s + Number(f.balance), 0)
       msg += `*⚠️ Outstanding Fees:*\n`
       outstanding.forEach((f, i) => {
-        msg += `\n*${i+1}.* ${f.fee_name} — *KES ${Number(f.balance).toLocaleString()}*`
+        msg += `\n*${i + 1}.* ${f.fee_name} — *KES ${Number(f.balance).toLocaleString()}*`
       })
       msg += `\n\n💰 *Total Remaining: KES ${totalOwed.toLocaleString()}*`
-
       if (cleared.length > 0) {
         msg += `\n\n*✅ Cleared Fees (${cleared.length}):*`
-        cleared.forEach(f => {
-          msg += `\n• ${f.fee_name} ✅`
-        })
+        cleared.forEach(f => { msg += `\n• ${f.fee_name} ✅` })
       }
-
-      msg += `\n\n─────────────────`
-      msg += `\nType *hi* to pay now`
-      msg += `\nType *balance* to refresh`
+      msg += `\n\n─────────────────\nType *hi* to pay now\nType *balance* to refresh`
     }
 
-    return {
-      text: msg,
-      nextStep: 'welcome',
-      sessionData: { student_id: studentId }
-    }
+    return { text: msg, nextStep: 'welcome', sessionData: { student_id: studentId } }
   } catch (err) {
     console.error('showBalance error:', err.message)
     return {
@@ -195,7 +515,7 @@ async function showBalance(data, phone) {
 
 function welcome() {
   return {
-    text: `👋 *Welcome to SchoolPay!* 🏫\n\nPay school fees securely via WhatsApp.\n\nPlease enter your *email address* for your payment receipt:\n📧 _(e.g. parent@gmail.com)_`,
+    text: `👋 *Welcome to SchoolPay!* 🏫\n\nPay school fees securely.\n\nPlease enter your *email address* for your payment receipt:\n📧 _(e.g. parent@gmail.com)_`,
     nextStep: 'ask_email',
     sessionData: {}
   }
@@ -228,7 +548,7 @@ async function askAdmission(data, body) {
       .eq('is_active', true)
       .single()
     student = s
-  } catch (e) { /* not found */ }
+  } catch (e) {}
 
   if (!student) {
     return {
@@ -260,7 +580,7 @@ async function askAdmission(data, body) {
   const total = outstanding.reduce((s, f) => s + Number(f.balance), 0)
   let msg = `👤 *${student.first_name} ${student.last_name}*\n🏫 ${cls} | ${student.admission_number}\n\n📊 *Outstanding Fees:*\n`
   outstanding.forEach((f, i) => {
-    msg += `\n*${i+1}.* ${f.fee_name} — *KES ${Number(f.balance).toLocaleString()}*`
+    msg += `\n*${i + 1}.* ${f.fee_name} — *KES ${Number(f.balance).toLocaleString()}*`
   })
   msg += `\n\n💰 *Total: KES ${total.toLocaleString()}*`
   msg += `\n\n─────────────────`
@@ -286,9 +606,7 @@ function showFees(data, body) {
   if (!fees.length) return welcome()
 
   const input = body.trim().toUpperCase()
-  let selected = []
-  let total = 0
-  let label = ''
+  let selected = [], total = 0, label = ''
 
   if (input === 'ALL') {
     selected = fees
@@ -317,12 +635,8 @@ function showFees(data, body) {
 
 function chooseMethod(data, body) {
   const c = body.trim()
-  if (!['1','2','3'].includes(c)) {
-    return {
-      text: `Type *1* M-Pesa, *2* Card, *3* Bank Transfer`,
-      nextStep: 'choose_method',
-      sessionData: data
-    }
+  if (!['1', '2', '3'].includes(c)) {
+    return { text: `Type *1* M-Pesa, *2* Card, *3* Bank Transfer`, nextStep: 'choose_method', sessionData: data }
   }
 
   if (c === '1') {
@@ -377,10 +691,7 @@ async function doMpesa(data, body, phone) {
         amount: Math.round(Number(data.total_amount) * 100),
         currency: 'KES',
         reference: ref,
-        mobile_money: {
-          phone: paystackPhone,
-          provider: 'mpesa'
-        },
+        mobile_money: { phone: paystackPhone, provider: 'mpesa' },
         metadata: {
           school_id: SCHOOL_ID,
           student_id: data.student_id,
@@ -392,25 +703,17 @@ async function doMpesa(data, body, phone) {
           channel: 'whatsapp_mpesa'
         }
       },
-      {
-        headers: {
-          Authorization: `Bearer ${PAYSTACK_SECRET}`,
-          'Content-Type': 'application/json'
-        }
-      }
+      { headers: { Authorization: `Bearer ${PAYSTACK_SECRET}`, 'Content-Type': 'application/json' } }
     )
 
     const result = res.data
     console.log('[MPESA] Paystack response:', JSON.stringify(result))
 
-    if (result.status === false) {
-      throw new Error(result.message || 'Paystack rejected request')
-    }
+    if (result.status === false) throw new Error(result.message || 'Paystack rejected request')
 
     const status = result.data?.status
     const displayText = result.data?.display_text || ''
 
-    // Save pending payments
     await savePending(data, ref, 'mpesa')
 
     if (status === 'success') {
@@ -422,17 +725,14 @@ async function doMpesa(data, body, phone) {
       }
     }
 
-    // pay_offline = STK push sent, waiting for PIN
     return {
       text: `📱 *STK Push Sent!*\n\n✅ Check phone *${paystackPhone}* now.\n\n👉 *Enter your M-Pesa PIN* on the popup.\n\n💰 *KES ${Number(data.total_amount).toLocaleString()}*\n📋 ${data.fee_label}\n🔑 Ref: ${ref}\n\n${displayText ? `_${displayText}_\n\n` : ''}⏳ *60 seconds* to enter PIN.\n\n_✅ You will receive automatic confirmation here once payment is complete. No action needed!_`,
       nextStep: 'welcome',
       sessionData: { waiting_ref: ref, guardian_phone: phone }
     }
-
   } catch (err) {
     const msg = err.response?.data?.message || err.message || 'Unknown error'
-    console.error('[MPESA] Error:', msg, JSON.stringify(err.response?.data))
-
+    console.error('[MPESA] Error:', msg)
     return {
       text: `❌ *M-Pesa Failed*\n\n_${msg}_\n\n*Common fixes:*\n• Make sure M-Pesa is activated on the number\n• Try format: *0712345678*\n• Check Paystack dashboard has M-Pesa enabled\n\n*Type:*\n*1* → Retry M-Pesa\n*2* → Pay by card\n*0* → Main menu`,
       nextStep: 'choose_method',
@@ -444,11 +744,7 @@ async function doMpesa(data, body, phone) {
 function cardNumber(data, body) {
   const n = body.replace(/\s/g, '')
   if (!/^\d{16}$/.test(n)) {
-    return {
-      text: `❌ Invalid. Enter your *16-digit card number* (no spaces):`,
-      nextStep: 'card_number',
-      sessionData: data
-    }
+    return { text: `❌ Invalid. Enter your *16-digit card number* (no spaces):`, nextStep: 'card_number', sessionData: data }
   }
   return {
     text: `✅ Card saved.\n\n*Step 2 of 3* — Enter *Expiry Date*:\n_(MM/YY — e.g. 12/26)_`,
@@ -459,11 +755,7 @@ function cardNumber(data, body) {
 
 function cardExpiry(data, body) {
   if (!/^\d{2}\/\d{2}$/.test(body.trim())) {
-    return {
-      text: `❌ Invalid. Enter expiry as *MM/YY*:\n_(e.g. 12/26)_`,
-      nextStep: 'card_expiry',
-      sessionData: data
-    }
+    return { text: `❌ Invalid. Enter expiry as *MM/YY*:\n_(e.g. 12/26)_`, nextStep: 'card_expiry', sessionData: data }
   }
   return {
     text: `✅ Expiry saved.\n\n*Step 3 of 3* — Enter your *CVV*:\n_(3-digit code on back of card)_`,
@@ -474,11 +766,7 @@ function cardExpiry(data, body) {
 
 async function cardCvv(data, body, phone) {
   if (!/^\d{3,4}$/.test(body.trim())) {
-    return {
-      text: `❌ Invalid CVV. Enter the *3-digit* code on the back of your card:`,
-      nextStep: 'card_cvv',
-      sessionData: data
-    }
+    return { text: `❌ Invalid CVV. Enter the *3-digit* code on the back of your card:`, nextStep: 'card_cvv', sessionData: data }
   }
 
   const [expMonth, expYear] = data.card_expiry.split('/')
@@ -533,7 +821,6 @@ async function cardCvv(data, body, phone) {
       nextStep: 'welcome',
       sessionData: {}
     }
-
   } catch (err) {
     const msg = err.response?.data?.message || 'Card declined'
     console.error('[CARD] Error:', msg)
@@ -546,15 +833,13 @@ async function cardCvv(data, body, phone) {
 }
 
 // ============================================================
-// PAYSTACK WEBHOOK — Auto fires when M-Pesa PIN entered
+// PAYSTACK WEBHOOK — Auto-confirm M-Pesa PIN payments
 // ============================================================
 app.post('/webhook/paystack-confirm', async (req, res) => {
   try {
     const hash = crypto.createHmac('sha512', PAYSTACK_SECRET)
       .update(JSON.stringify(req.body)).digest('hex')
-    if (hash !== req.headers['x-paystack-signature']) {
-      return res.status(400).send('Bad signature')
-    }
+    if (hash !== req.headers['x-paystack-signature']) return res.status(400).send('Bad signature')
 
     const event = req.body
     console.log('[WEBHOOK]', event.event, event.data?.reference)
@@ -563,12 +848,10 @@ app.post('/webhook/paystack-confirm', async (req, res) => {
       const { reference, amount, metadata, customer } = event.data
       const paid = amount / 100
 
-      // Update payments to success
       await supabase.from('payments')
         .update({ status: 'success', paystack_transaction_id: event.data.id, updated_at: new Date().toISOString() })
         .eq('paystack_reference', reference)
 
-      // Update each fee balance
       const { data: pmts } = await supabase
         .from('payments').select('student_fee_id, amount').eq('paystack_reference', reference)
 
@@ -584,14 +867,17 @@ app.post('/webhook/paystack-confirm', async (req, res) => {
         }).eq('id', p.student_fee_id)
       }
 
-      // Auto WhatsApp confirmation to guardian
       const rawPhone = metadata?.guardian_phone
+      const channel = metadata?.channel || ''
+
       if (rawPhone) {
-        const wa = toWhatsappPhone(rawPhone)
-        console.log('[WEBHOOK] Sending confirmation to:', wa)
-        await sendWA(wa,
-          `✅ *Payment Confirmed!*\n\n🎉 Dear ${metadata?.guardian_name || 'Guardian'},\n\n👤 Student: *${metadata?.student_name}*\n💰 Amount: *KES ${paid.toLocaleString()}*\n📋 Fee: *${metadata?.fee_label || 'School Fees'}*\n🔑 Ref: *${reference}*\n\n📧 Receipt → *${customer.email}*\n\n🙏 Thank you for investing in your child's education!\n\nType *balance* to see remaining fees or *hi* to pay again.`
-        )
+        const confirmMsg = `✅ *Payment Confirmed!*\n\n🎉 Dear ${metadata?.guardian_name || 'Guardian'},\n\n👤 Student: *${metadata?.student_name}*\n💰 Amount: *KES ${paid.toLocaleString()}*\n📋 Fee: *${metadata?.fee_label || 'School Fees'}*\n🔑 Ref: *${reference}*\n\n📧 Receipt → *${customer.email}*\n\n🙏 Thank you for investing in your child's education!\n\nType *balance* to see remaining fees or *hi* to pay again.`
+
+        if (channel.includes('ussd')) {
+          await sendSMS(rawPhone, confirmMsg.replace(/\*/g, ''))
+        } else {
+          await sendWA(rawPhone, confirmMsg)
+        }
       }
     }
   } catch (err) {
@@ -602,7 +888,7 @@ app.post('/webhook/paystack-confirm', async (req, res) => {
 })
 
 // ============================================================
-// DASHBOARD API — Send reminder to one student's guardian
+// DASHBOARD API — Single reminder
 // ============================================================
 app.post('/api/send-reminder', async (req, res) => {
   const { student_id } = req.body
@@ -623,9 +909,7 @@ app.post('/api/send-reminder', async (req, res) => {
       .eq('student_id', student_id)
       .gt('balance', 0)
 
-    if (!fees || fees.length === 0) {
-      return res.json({ success: true, message: 'No outstanding fees' })
-    }
+    if (!fees || fees.length === 0) return res.json({ success: true, message: 'No outstanding fees' })
 
     const total = fees.reduce((s, f) => s + Number(f.balance), 0)
     const lines = fees.map(f => `• ${f.fee_name}: KES ${Number(f.balance).toLocaleString()}`).join('\n')
@@ -633,18 +917,19 @@ app.post('/api/send-reminder', async (req, res) => {
       ? `${student.classes.name}${student.classes.stream ? ' ' + student.classes.stream : ''}`
       : ''
 
-    // Priority: guardian1_whatsapp → guardian1_phone
     const rawPhone = student.guardian1_whatsapp || student.guardian1_phone
     if (!rawPhone) return res.status(400).json({ error: 'No phone number for guardian' })
 
-    const wa = toWhatsappPhone(rawPhone)
-    console.log(`[REMINDER] ${student.first_name} ${student.last_name} → ${wa}`)
+    const msg = `🔔 *Payment Reminder*\n\nDear *${student.guardian1_name}*,\n\nOutstanding fees for *${student.first_name} ${student.last_name}* (${cls}):\n\n${lines}\n\n💰 *Total: KES ${total.toLocaleString()}*\n\nTo pay, WhatsApp us and type *hi* to pay or *balance* to check fees 😊\n\nThank you! 🙏`
 
-    await sendWA(wa,
-      `🔔 *Payment Reminder*\n\nDear *${student.guardian1_name}*,\n\nOutstanding fees for *${student.first_name} ${student.last_name}* (${cls}):\n\n${lines}\n\n💰 *Total: KES ${total.toLocaleString()}*\n\nTo pay, WhatsApp us and type *hi* to pay or *balance* to check fees 😊\n\nThank you! 🙏`
-    )
+    // Send via WhatsApp if whatsapp number available, else SMS
+    if (student.guardian1_whatsapp) {
+      await sendWA(student.guardian1_whatsapp, msg)
+    } else {
+      await sendSMS(rawPhone, msg.replace(/\*/g, ''))
+    }
 
-    res.json({ success: true, sent_to: wa, student: `${student.first_name} ${student.last_name}`, total })
+    res.json({ success: true, sent_to: toE164(rawPhone), student: `${student.first_name} ${student.last_name}`, total })
   } catch (err) {
     console.error('[REMINDER] Error:', err.message)
     res.status(500).json({ error: err.message })
@@ -652,7 +937,7 @@ app.post('/api/send-reminder', async (req, res) => {
 })
 
 // ============================================================
-// DASHBOARD API — Bulk reminders to all guardians
+// DASHBOARD API — Bulk reminders
 // ============================================================
 app.post('/api/send-reminders', async (req, res) => {
   try {
@@ -675,13 +960,16 @@ app.post('/api/send-reminders', async (req, res) => {
       const raw = s?.guardian1_whatsapp || s?.guardian1_phone
       if (!raw) { skipped++; continue }
 
-      const wa = toWhatsappPhone(raw)
       const lines = sd.fees.map(f => `• ${f.fee_name}: KES ${Number(f.balance).toLocaleString()}`).join('\n')
       const total = sd.fees.reduce((s, f) => s + Number(f.balance), 0)
+      const msg = `🔔 *Payment Reminder*\n\nDear *${s.guardian1_name}*,\n\nOutstanding fees for *${sd.name}*:\n\n${lines}\n\n💰 *Total: KES ${total.toLocaleString()}*\n\nType *hi* to pay or *balance* to check fees 😊\n\n🙏 Thank you!`
 
-      await sendWA(wa,
-        `🔔 *Payment Reminder*\n\nDear *${s.guardian1_name}*,\n\nOutstanding fees for *${sd.name}*:\n\n${lines}\n\n💰 *Total: KES ${total.toLocaleString()}*\n\nType *hi* to pay or *balance* to check fees 😊\n\n🙏 Thank you!`
-      )
+      if (s.guardian1_whatsapp) {
+        await sendWA(s.guardian1_whatsapp, msg)
+      } else {
+        await sendSMS(raw, msg.replace(/\*/g, ''))
+      }
+
       sent++
       await new Promise(r => setTimeout(r, 700))
     }
@@ -733,17 +1021,6 @@ async function confirmAndUpdate(ref, data) {
   }
 }
 
-async function sendWA(phone, message) {
-  try {
-    const to = `whatsapp:${toWhatsappPhone(phone)}`
-    console.log(`[WA] Sending to ${to}`)
-    const r = await twilioClient.messages.create({ from: BOT_NUMBER, to, body: message })
-    console.log(`[WA] ✅ Sent SID: ${r.sid}`)
-  } catch (err) {
-    console.error(`[WA] ❌ Failed to ${phone}:`, err.message)
-  }
-}
-
 async function getSession(phone) {
   try {
     const { data } = await supabase
@@ -757,7 +1034,6 @@ async function getSession(phone) {
       return s || { phone_number: phone, current_step: 'welcome', session_data: {} }
     }
 
-    // Expire after 30 min inactivity
     if (data.last_activity && (Date.now() - new Date(data.last_activity)) > 30 * 60 * 1000) {
       await supabase.from('whatsapp_sessions')
         .update({ current_step: 'welcome', session_data: {}, last_activity: new Date() })
@@ -794,7 +1070,12 @@ async function resetSession(phone) {
   }
 }
 
-app.get('/health', (_, res) => res.json({ status: 'ok', service: 'SchoolPay Bot', time: new Date().toISOString() }))
+app.get('/health', (_, res) => res.json({
+  status: 'ok',
+  service: 'SchoolPay Bot',
+  channels: ['WhatsApp (Twilio)', 'SMS (Africa\'s Talking)', 'USSD (Africa\'s Talking)'],
+  time: new Date().toISOString()
+}))
 
 const PORT = process.env.PORT || 3000
 app.listen(PORT, () => console.log(`🚀 SchoolPay Bot running on port ${PORT}`))
