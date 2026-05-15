@@ -102,35 +102,40 @@ async function buildSuccessMessage(studentId, paidAmount, feeLabel, ref, email, 
     const totalRemaining = outstanding.reduce((s, f) => s + Number(f.balance), 0)
 
     if (outstanding.length === 0) {
-      remainingSection = `\n🎊 *All school fees are now fully cleared!*\nNo outstanding balance. Well done! 🏆`
+      remainingSection  = `\n\n🎊 *All school fees are now fully cleared!*`
+      remainingSection += `\nNo outstanding balance remaining. Well done! 🏆`
     } else {
-      remainingSection = `\n📊 *Remaining Balance:*\n`
-      outstanding.forEach(f => {
-        let line = `\n• ${f.fee_name}: *KES ${Number(f.balance).toLocaleString()}*`
+      remainingSection  = `\n\n📋 *Remaining Balance*\n`
+      outstanding.forEach((f, i) => {
+        remainingSection += `\n  ${i + 1}. ${f.fee_name}`
+        remainingSection += `\n     *KES ${Number(f.balance).toLocaleString()}*`
         if (f.due_date) {
           const due = new Date(f.due_date).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })
-          line += ` _(due ${due})_`
+          remainingSection += ` — _due ${due}_`
         }
-        remainingSection += line
       })
       remainingSection += `\n\n💰 *Total Remaining: KES ${totalRemaining.toLocaleString()}*`
-      remainingSection += `\n\n_Please clear remaining fees before their deadlines to avoid disruption to your child's studies._`
+      remainingSection += `\n\n_Kindly clear the remaining fees before the deadlines to avoid disruption to your child's studies._`
     }
   } catch (e) {
     console.error('buildSuccessMessage balance error:', e.message)
   }
 
-  let msg = `✅ *Payment Confirmed!* 🎉\n\n`
-  msg += `Dear *${guardianName}*,\n\n`
-  msg += `👤 Student: *${studentName}*\n`
-  msg += `💰 Paid: *KES ${Number(paidAmount).toLocaleString()}*\n`
-  msg += `📋 For: *${feeLabel}*\n`
-  msg += `🔑 Ref: *${ref}*\n`
-  if (email) msg += `📧 Receipt → *${email}*\n`
-  msg += `\n━━━━━━━━━━━━━━━━`
+  let msg = ``
+  msg += `✅ *Payment Confirmed!*\n`
+  msg += `━━━━━━━━━━━━━━━━━━━━\n\n`
+  msg += `Dear *${guardianName}*, 🎉\n\n`
+  msg += `Your payment has been successfully received.\n\n`
+  msg += `  👤 Student:   *${studentName}*\n`
+  msg += `  💰 Amount:    *KES ${Number(paidAmount).toLocaleString()}*\n`
+  msg += `  📋 Fee:       ${feeLabel}\n`
+  msg += `  🔑 Reference: \`${ref}\`\n`
+  if (email) msg += `  📧 Receipt:   ${email}\n`
+  msg += `\n━━━━━━━━━━━━━━━━━━━━`
   msg += remainingSection
-  msg += `\n━━━━━━━━━━━━━━━━`
-  msg += `\n\n🙏 Thank you for investing in your child's future!\n\n_Type *balance* to check fees | *hi* to pay more_`
+  msg += `\n━━━━━━━━━━━━━━━━━━━━`
+  msg += `\n\n🙏 Thank you for investing in *${studentName.split(' ')[0]}'s* education!\n\n`
+  msg += `_Type *balance* to check fees · *hi* to make another payment_`
 
   return msg
 }
@@ -514,12 +519,12 @@ function getStepPrompt(step, data) {
     case 'welcome': return welcome()
 
     case 'ask_email': return {
-      text: `📧 Enter your *email address* for your payment receipt:\n_(e.g. parent@gmail.com)_\n\n_Type *6* for main menu_`,
+      text: `📧 *Enter Your Email Address*\n\nPlease provide your email so we can send your payment receipt.\n\n  _(e.g. parent@gmail.com)_\n\n_*6* for main menu_`,
       nextStep: 'ask_email', sessionData: data
     }
 
     case 'ask_admission': return {
-      text: `✅ Email: *${data.email}*\n\n🎓 Enter the student's *Admission Number*:\n_(e.g. ADM/2025/001)_\n\n_*0* back | *6* menu_`,
+      text: `✅ Email on file: _${data.email}_\n\n🎓 *Enter Student Admission Number*\n\n  _(e.g. ADM/2025/001)_\n\n_*0* back · *6* menu_`,
       nextStep: 'ask_admission', sessionData: data
     }
 
@@ -527,32 +532,34 @@ function getStepPrompt(step, data) {
       const fees = data.fees || []
       if (!fees.length) return welcome()
       const total = fees.reduce((s, f) => s + Number(f.balance), 0)
-      let msg = `📊 *Outstanding Fees — ${data.student_name}:*\n`
-      fees.forEach((f, i) => { msg += `\n*${i + 1}.* ${f.fee_name} — *KES ${Number(f.balance).toLocaleString()}*` })
-      msg += `\n\n💰 *Total: KES ${total.toLocaleString()}*`
-      msg += `\n\n─────────────────`
-      msg += `\nType *1* for one fee, *1,2* for multiple, *ALL* for everything`
-      msg += `\n_*0* back | *6* menu_`
+      let msg = `📋 *Outstanding Fees*\n━━━━━━━━━━━━━━━━━━━━\n\n👤 *${data.student_name}*\n\n`
+      fees.forEach((f, i) => {
+        msg += `  *${i + 1}.* ${f.fee_name}\n`
+        msg += `       *KES ${Number(f.balance).toLocaleString()}*\n\n`
+      })
+      msg += `━━━━━━━━━━━━━━━━━━━━\n💰 *Total Due: KES ${total.toLocaleString()}*\n━━━━━━━━━━━━━━━━━━━━\n\n`
+      msg += `Reply with:\n  • A *number* to pay one fee _(e.g. 1)_\n  • *1,2* or *1,3* to pay multiple\n  • *ALL* to pay everything at once\n\n`
+      msg += `_*0* back · *6* menu_`
       return { text: msg, nextStep: 'show_fees', sessionData: data }
     }
 
     case 'choose_method': return {
-      text: `💳 *Payment Summary*\n\n📋 ${data.fee_label}\n💰 *KES ${Number(data.total_amount).toLocaleString()}*\n👤 ${data.student_name}\n\n─────────────────\n*1.* 📱 M-Pesa STK Push\n*2.* 💳 Card (Visa/Mastercard)\n*3.* 🏦 Bank Transfer\n\n_*0* back | *6* menu_`,
+      text: `💳 *Payment Summary*\n━━━━━━━━━━━━━━━━━━━━\n\n  👤 ${data.student_name}\n  📋 ${data.fee_label}\n  💰 *KES ${Number(data.total_amount).toLocaleString()}*\n\n━━━━━━━━━━━━━━━━━━━━\n*Select Payment Method:*\n\n  *1* 📱  M-Pesa STK Push\n  *2* 💳  Card _(Visa / Mastercard)_\n  *3* 🏦  Bank Transfer\n\n━━━━━━━━━━━━━━━━━━━━\n_*0* back · *6* menu_`,
       nextStep: 'choose_method', sessionData: data
     }
 
     case 'ask_mpesa_phone': return {
-      text: `📱 *M-Pesa Payment*\n\n💰 *KES ${Number(data.total_amount).toLocaleString()}*\n📋 ${data.fee_label}\n\nEnter M-Pesa number:\n_(e.g. 0712345678)_\n\n_*0* back | *6* menu_`,
+      text: `📱 *M-Pesa Payment*\n━━━━━━━━━━━━━━━━━━━━\n\n  💰 *KES ${Number(data.total_amount).toLocaleString()}*\n  📋 ${data.fee_label}\n\nEnter the *M-Pesa number* to receive the payment prompt:\n\n  _(e.g. 0712 345 678)_\n\n_*0* back · *6* menu_`,
       nextStep: 'ask_mpesa_phone', sessionData: data
     }
 
     case 'card_number': return {
-      text: `💳 *Card Payment — Step 1 of 3*\n\nEnter your *16-digit card number*:\n_(No spaces — e.g. 4111111111111111)_\n🔒 Secured by Paystack\n\n_*0* back | *6* menu_`,
+      text: `💳 *Card Payment — Step 1 of 3*\n━━━━━━━━━━━━━━━━━━━━\n\nPlease enter your *16-digit card number*:\n\n  _(No spaces — e.g. 4111 1111 1111 1111)_\n\n🔒 _Secured by Paystack_\n\n_*0* back · *6* menu_`,
       nextStep: 'card_number', sessionData: data
     }
 
     case 'card_expiry': return {
-      text: `*Card Payment — Step 2 of 3*\n\nEnter *Expiry Date*:\n_(MM/YY — e.g. 12/26)_\n\n_*0* back | *6* menu_`,
+      text: `💳 *Card Payment — Step 2 of 3*\n━━━━━━━━━━━━━━━━━━━━\n\nEnter your card *Expiry Date*:\n\n  _(MM/YY — e.g. 12/26)_\n\n_*0* back · *6* menu_`,
       nextStep: 'card_expiry', sessionData: data
     }
 
@@ -629,7 +636,7 @@ async function fetchResults(studentId) {
 
     if (!results || results.length === 0) {
       return {
-        text: `📊 *Academic Results ${year}*\n\n👤 *${name}*${cls ? ` | ${cls}` : ''}\n\n_No results found for ${year}._\n\nResults are uploaded by the school's teachers.\n\n_Type *balance* for fees | *hi* for menu_`,
+        text: `📊 *Academic Results — ${year}*\n━━━━━━━━━━━━━━━━━━━━\n\n  👤 *${name}*${cls ? `\n  🏫 ${cls}` : ''}\n\n━━━━━━━━━━━━━━━━━━━━\nNo results have been recorded for ${year} yet.\n\nResults are uploaded by the school's teachers after each examination.\n\n_Type *balance* for fees · *hi* for menu_`,
         nextStep: 'welcome',
         sessionData: { student_id: studentId }
       }
@@ -644,27 +651,30 @@ async function fetchResults(studentId) {
       byTerm[tk][r.subject].push(r)
     })
 
-    let msg = `📊 *Academic Results ${year}*\n\n`
-    msg += `👤 *${name}*${cls ? ` | ${cls}` : ''}\n`
+    let msg = `📊 *Academic Results — ${year}*\n`
+    msg += `━━━━━━━━━━━━━━━━━━━━\n\n`
+    msg += `  👤 *${name}*\n`
+    if (cls) msg += `  🏫 ${cls}\n`
     const allPcts = []
 
     Object.entries(byTerm).forEach(([termLabel, subjects]) => {
-      msg += `\n━━━━━━━━━━━━━━━━`
-      msg += `\n📅 *${termLabel}*\n`
+      msg += `\n━━━━━━━━━━━━━━━━━━━━\n`
+      msg += `📅 *${termLabel}*\n`
 
       Object.entries(subjects).forEach(([subject, exams]) => {
-        msg += `\n📚 *${subject}*`
+        msg += `\n  📚 *${subject}*\n`
         let subSum = 0, subCount = 0
         exams.forEach(e => {
           const pct = Math.round((e.marks_scored / e.total_marks) * 100)
           const gr = gradeLabel(pct)
           const label = EXAM_LABELS[e.exam_type] || e.exam_type
-          msg += `\n  • ${label}: ${e.marks_scored}/${e.total_marks} → *${pct}% ${gr}*`
+          const padLabel = label.padEnd(12, ' ')
+          msg += `    ${padLabel} ${e.marks_scored}/${e.total_marks}  →  *${pct}%  ${gr}*\n`
           subSum += pct; subCount++; allPcts.push(pct)
         })
         if (subCount > 1) {
           const avg = Math.round(subSum / subCount)
-          msg += `\n  _Avg: ${avg}% — ${gradeLabel(avg)} (${gradeRemark(avg)})_`
+          msg += `    _Subject Avg: ${avg}% — ${gradeLabel(avg)} (${gradeRemark(avg)})_\n`
         }
       })
     })
@@ -672,13 +682,13 @@ async function fetchResults(studentId) {
     if (allPcts.length > 0) {
       const overall = Math.round(allPcts.reduce((a, b) => a + b, 0) / allPcts.length)
       const og = gradeLabel(overall)
-      msg += `\n\n━━━━━━━━━━━━━━━━`
-      msg += `\n📈 *Overall Average: ${overall}% — Grade ${og}*`
-      msg += `\n_${gradeRemark(overall)}_`
-      msg += `\n━━━━━━━━━━━━━━━━`
+      msg += `\n━━━━━━━━━━━━━━━━━━━━\n`
+      msg += `📈 *Overall Average: ${overall}% — Grade ${og}*\n`
+      msg += `_${gradeRemark(overall)}_\n`
+      msg += `━━━━━━━━━━━━━━━━━━━━`
     }
 
-    msg += `\n\n_Type *balance* for fees | *hi* to pay | *results* to refresh_`
+    msg += `\n\n_Type *balance* for fees · *hi* to pay · *results* to refresh_`
 
     return {
       text: msg,
@@ -713,25 +723,32 @@ async function showBalance(data, phone) {
     const cleared = (allFees || []).filter(f => Number(f.balance) <= 0)
     const cls = student?.classes ? `${student.classes.name}${student.classes.stream ? ' ' + student.classes.stream : ''}` : 'N/A'
 
-    let msg = `📊 *Fee Balance*\n\n👤 *${student?.first_name} ${student?.last_name}*\n🏫 ${cls}\n\n`
+    let msg = `📊 *Fee Balance Statement*\n━━━━━━━━━━━━━━━━━━━━\n\n`
+    msg += `👤 *${student?.first_name} ${student?.last_name}*\n`
+    msg += `🏫 ${cls}\n\n`
+    msg += `━━━━━━━━━━━━━━━━━━━━\n`
     if (outstanding.length === 0) {
-      msg += `✅ *All fees are cleared!*\n\nNo outstanding balance. 🎉`
+      msg += `✅ *All Fees Cleared!*\n\nThis student has no outstanding balance.\nThank you for keeping up with payments! 🎉`
     } else {
       const totalOwed = outstanding.reduce((s, f) => s + Number(f.balance), 0)
-      msg += `*⚠️ Outstanding Fees:*\n`
+      msg += `⚠️ *Outstanding Fees*\n\n`
       outstanding.forEach((f, i) => {
-        msg += `\n*${i + 1}.* ${f.fee_name} — *KES ${Number(f.balance).toLocaleString()}*`
+        msg += `  *${i + 1}.* ${f.fee_name}\n`
+        msg += `       *KES ${Number(f.balance).toLocaleString()}*`
         if (f.due_date) {
           const due = new Date(f.due_date).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })
-          msg += ` _(due ${due})_`
+          msg += ` — _due ${due}_`
         }
+        msg += `\n\n`
       })
-      msg += `\n\n💰 *Total Remaining: KES ${totalOwed.toLocaleString()}*`
+      msg += `━━━━━━━━━━━━━━━━━━━━\n`
+      msg += `💰 *Total Remaining: KES ${totalOwed.toLocaleString()}*\n`
       if (cleared.length > 0) {
-        msg += `\n\n*✅ Cleared Fees (${cleared.length}):*`
-        cleared.forEach(f => { msg += `\n• ${f.fee_name} ✅` })
+        msg += `\n✅ *Cleared (${cleared.length}):* `
+        msg += cleared.map(f => f.fee_name).join(', ')
       }
-      msg += `\n\n─────────────────\nType *hi* to pay now\nType *balance* to refresh`
+      msg += `\n━━━━━━━━━━━━━━━━━━━━\n\n`
+      msg += `_Type *hi* to pay now · *balance* to refresh_`
     }
     return { text: msg, nextStep: 'welcome', sessionData: { student_id: studentId } }
   } catch (err) {
@@ -742,7 +759,7 @@ async function showBalance(data, phone) {
 
 function welcome() {
   return {
-    text: `👋 *Welcome to SchoolPay!* 🏫\n\nPay school fees securely.\n\nPlease enter your *email address* for your payment receipt:\n📧 _(e.g. parent@gmail.com)_\n\n_Shortcuts: *balance* check fees | *results* academic results | *0* back | *6* menu_`,
+    text: `🏫 *SchoolPay — School Fee Payment*\n━━━━━━━━━━━━━━━━━━━━\n\nHello! 👋 Welcome to SchoolPay.\n\nTo get started, please enter your *email address*.\nThis is where we will send your payment receipt.\n\n  📧 _(e.g. parent@gmail.com)_\n\n━━━━━━━━━━━━━━━━━━━━\n_Quick commands: *balance* · *results* · *0* back · *6* menu_`,
     nextStep: 'ask_email', sessionData: {}
   }
 }
@@ -751,12 +768,12 @@ function askEmail(data, body) {
   const email = body.trim().toLowerCase()
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
     return {
-      text: `❌ Invalid email. Please enter a valid email address:\n_(e.g. parent@gmail.com)_\n\n_*6* for main menu_`,
+      text: `❌ *Invalid Email Address*\n\nThe email you entered doesn't appear to be valid.\nPlease try again.\n\n  📧 _(e.g. parent@gmail.com)_\n\n_*6* for main menu_`,
       nextStep: 'ask_email', sessionData: {}
     }
   }
   return {
-    text: `✅ Email saved!\n\nNow enter the student's *Admission Number*:\n_(e.g. ADM/2025/001)_\n\n_*0* back | *6* menu_`,
+    text: `✅ *Email Saved!*\n\n  📧 ${email}\n\nNow please enter the student's *Admission Number*.\n\n  🎓 _(e.g. ADM/2025/001)_\n\n_*0* back · *6* menu_`,
     nextStep: 'ask_admission', sessionData: { email }
   }
 }
@@ -771,7 +788,7 @@ async function askAdmission(data, body) {
 
   if (!student) {
     return {
-      text: `❌ Student *${body.trim()}* not found.\n\nCheck the admission number and try again.\n_*0* back | *6* menu_`,
+      text: `❌ *Student Not Found*\n\n"${body.trim()}" does not match any student record.\n\nPlease check the admission number and try again.\n\n  🎓 _(e.g. ADM/2025/001)_\n\n_*0* back · *6* menu_`,
       nextStep: 'ask_admission', sessionData: data
     }
   }
@@ -782,18 +799,27 @@ async function askAdmission(data, body) {
 
   if (!outstanding.length) {
     return {
-      text: `✅ *All fees cleared!*\n\n👤 *${student.first_name} ${student.last_name}*\n🏫 ${cls}\n\nNo outstanding fees. Thank you! 🎉\n\n_Type *balance* to check or *hi* to start again_`,
+      text: `✅ *All Fees Cleared!*\n━━━━━━━━━━━━━━━━━━━━\n\n  👤 *${student.first_name} ${student.last_name}*\n  🏫 ${cls}\n\nThis student has no outstanding fees.\nThank you for keeping up with payments! 🎉\n\n_Type *balance* to check · *hi* to start again_`,
       nextStep: 'welcome', sessionData: {}
     }
   }
 
   const total = outstanding.reduce((s, f) => s + Number(f.balance), 0)
-  let msg = `👤 *${student.first_name} ${student.last_name}*\n🏫 ${cls} | ${student.admission_number}\n\n📊 *Outstanding Fees:*\n`
-  outstanding.forEach((f, i) => { msg += `\n*${i + 1}.* ${f.fee_name} — *KES ${Number(f.balance).toLocaleString()}*` })
-  msg += `\n\n💰 *Total: KES ${total.toLocaleString()}*`
-  msg += `\n\n─────────────────`
-  msg += `\nType *1* for one fee, *1,2* or *1,3* for multiple, *ALL* for everything`
-  msg += `\n_*0* back | *6* menu_`
+  let msg = `📋 *Outstanding Fees*\n━━━━━━━━━━━━━━━━━━━━\n\n`
+  msg += `  👤 *${student.first_name} ${student.last_name}*\n`
+  msg += `  🏫 ${cls}  ·  ${student.admission_number}\n\n`
+  outstanding.forEach((f, i) => {
+    msg += `  *${i + 1}.* ${f.fee_name}\n`
+    msg += `       *KES ${Number(f.balance).toLocaleString()}*\n\n`
+  })
+  msg += `━━━━━━━━━━━━━━━━━━━━\n`
+  msg += `💰 *Total Due: KES ${total.toLocaleString()}*\n`
+  msg += `━━━━━━━━━━━━━━━━━━━━\n\n`
+  msg += `Reply with:\n`
+  msg += `  • A *number* to pay one fee _(e.g. 1)_\n`
+  msg += `  • *1,2* or *1,3* to pay multiple fees\n`
+  msg += `  • *ALL* to pay everything at once\n\n`
+  msg += `_*0* back · *6* menu_`
 
   return {
     text: msg, nextStep: 'show_fees',
@@ -846,7 +872,7 @@ function showFees(data, body) {
   }
 
   return {
-    text: `💳 *Payment Summary*\n\n📋 ${label}\n💰 *KES ${total.toLocaleString()}*\n👤 ${data.student_name}\n\n─────────────────\n*Choose payment method:*\n\n*1.* 📱 M-Pesa STK Push\n*2.* 💳 Card (Visa/Mastercard)\n*3.* 🏦 Bank Transfer\n\n_*0* back | *6* menu_`,
+    text: `💳 *Payment Summary*\n━━━━━━━━━━━━━━━━━━━━\n\n  👤 *${data.student_name}*\n  📋 ${label}\n  💰 *KES ${total.toLocaleString()}*\n\n━━━━━━━━━━━━━━━━━━━━\n*Select Payment Method:*\n\n  *1* 📱  M-Pesa STK Push\n  *2* 💳  Card _(Visa / Mastercard)_\n  *3* 🏦  Bank Transfer\n\n━━━━━━━━━━━━━━━━━━━━\n_*0* back · *6* menu_`,
     nextStep: 'choose_method',
     sessionData: { ...data, selected_fees: selected, total_amount: total, fee_label: label }
   }
@@ -855,17 +881,20 @@ function showFees(data, body) {
 function chooseMethod(data, body) {
   const c = body.trim()
   if (!['1', '2', '3'].includes(c)) {
-    return { text: `Type *1* M-Pesa, *2* Card, *3* Bank Transfer\n_*0* back | *6* menu_`, nextStep: 'choose_method', sessionData: data }
+    return {
+      text: `Please select a valid option:\n\n  *1* 📱  M-Pesa\n  *2* 💳  Card\n  *3* 🏦  Bank Transfer\n\n_*0* back · *6* menu_`,
+      nextStep: 'choose_method', sessionData: data
+    }
   }
   if (c === '1') {
     return {
-      text: `📱 *M-Pesa Payment*\n\n💰 Amount: *KES ${Number(data.total_amount).toLocaleString()}*\n📋 ${data.fee_label}\n\nEnter the *M-Pesa phone number* to receive the STK push:\n\n📲 Examples:\n• *0712345678*\n• *254712345678*\n\n_*0* back | *6* menu_`,
+      text: `📱 *M-Pesa Payment*\n━━━━━━━━━━━━━━━━━━━━\n\n  💰 Amount: *KES ${Number(data.total_amount).toLocaleString()}*\n  📋 ${data.fee_label}\n\nEnter the *M-Pesa phone number* that will receive the payment prompt:\n\n  📲 Accepted formats:\n  • 0712 345 678\n  • 254712345678\n  • +254712345678\n\n━━━━━━━━━━━━━━━━━━━━\n_*0* back · *6* menu_`,
       nextStep: 'ask_mpesa_phone', sessionData: data
     }
   }
   if (c === '2') {
     return {
-      text: `💳 *Card Payment*\n\n💰 *KES ${Number(data.total_amount).toLocaleString()}*\n\n*Step 1 of 3*\nEnter your *16-digit card number*:\n_(No spaces — e.g. 4111111111111111)_\n🔒 Secured by Paystack\n\n_*0* back | *6* menu_`,
+      text: `💳 *Card Payment — Step 1 of 3*\n━━━━━━━━━━━━━━━━━━━━\n\n  💰 Amount: *KES ${Number(data.total_amount).toLocaleString()}*\n\nPlease enter your *16-digit card number*.\n\n  _(No spaces — e.g. 4111 1111 1111 1111)_\n\n🔒 _Secured and encrypted by Paystack_\n\n━━━━━━━━━━━━━━━━━━━━\n_*0* back · *6* menu_`,
       nextStep: 'card_number', sessionData: data
     }
   }
@@ -873,7 +902,7 @@ function chooseMethod(data, body) {
     const ref = generateRef()
     savePending(data, ref, 'bank').catch(console.error)
     return {
-      text: `🏦 *Bank Transfer*\n\n💰 *KES ${Number(data.total_amount).toLocaleString()}*\n📋 ${data.fee_label}\n👤 ${data.student_name}\n\n━━━━━━━━━━━━━━━━\n🏦 Bank: *Equity Bank*\n📝 Account: *0123456789*\n🏷️ Name: *Sunshine Academy*\n🔑 Ref: *${ref}*\n━━━━━━━━━━━━━━━━\n\nUse *${ref}* as your payment reference.\n\n_Type *hi* to go back to menu_`,
+      text: `🏦 *Bank Transfer Details*\n━━━━━━━━━━━━━━━━━━━━\n\n  👤 ${data.student_name}\n  📋 ${data.fee_label}\n  💰 *KES ${Number(data.total_amount).toLocaleString()}*\n\n━━━━━━━━━━━━━━━━━━━━\n  🏦 Bank:    *Equity Bank*\n  📝 Account: *0123456789*\n  🏷️  Name:    *Sunshine Academy*\n  🔑 Ref:     *${ref}*\n━━━━━━━━━━━━━━━━━━━━\n\nUse *${ref}* as your payment reference when making the transfer.\n\n_Type *hi* to return to the main menu_`,
       nextStep: 'welcome', sessionData: {}
     }
   }
@@ -884,7 +913,7 @@ async function doMpesa(data, body, phone) {
   const digits = raw.replace(/\D/g, '')
   if (digits.length < 9 || digits.length > 12) {
     return {
-      text: `❌ Invalid number.\n\nEnter a valid M-Pesa number:\n• *0712345678*\n• *254712345678*\n\n_*0* back | *6* menu_`,
+      text: `❌ *Invalid Phone Number*\n\nThe number you entered is not valid.\nPlease enter a valid M-Pesa number:\n\n  • *0712345678*\n  • *254712345678*\n\n_*0* back · *6* menu_`,
       nextStep: 'ask_mpesa_phone', sessionData: data
     }
   }
@@ -925,14 +954,14 @@ async function doMpesa(data, body, phone) {
     }
 
     return {
-      text: `📱 *STK Push Sent!*\n\n✅ Check phone *${paystackPhone}* now.\n\n👉 *Enter your M-Pesa PIN* on the popup.\n\n💰 *KES ${Number(data.total_amount).toLocaleString()}*\n📋 ${data.fee_label}\n🔑 Ref: ${ref}\n\n${displayText ? `_${displayText}_\n\n` : ''}⏳ *60 seconds* to enter PIN.\n\n_✅ You will receive automatic confirmation with your remaining balance once payment is complete._`,
+      text: `📱 *M-Pesa — Payment Prompt Sent!*\n━━━━━━━━━━━━━━━━━━━━\n\n✅ A payment request has been sent to:\n   📲 *${paystackPhone}*\n\nPlease *enter your M-Pesa PIN* when the prompt appears on your phone.\n\n  💰 Amount: *KES ${Number(data.total_amount).toLocaleString()}*\n  📋 ${data.fee_label}\n  🔑 Ref: \`${ref}\`\n${displayText ? `\n  _${displayText}_\n` : ''}\n━━━━━━━━━━━━━━━━━━━━\n⏳ You have *60 seconds* to complete this.\n\n_Once confirmed, you will automatically receive a receipt with your remaining balance here._`,
       nextStep: 'welcome', sessionData: { waiting_ref: ref, guardian_phone: phone }
     }
   } catch (err) {
     const msg = err.response?.data?.message || err.message || 'Unknown error'
     console.error('[MPESA] Error:', msg)
     return {
-      text: `❌ *M-Pesa Failed*\n\n_${msg}_\n\n*Common fixes:*\n• Make sure M-Pesa is activated on the number\n• Try format: *0712345678*\n\n*1* → Retry M-Pesa\n*2* → Pay by card\n_*0* back | *6* menu_`,
+      text: `❌ *M-Pesa Payment Failed*\n━━━━━━━━━━━━━━━━━━━━\n\n_${msg}_\n\n*What to check:*\n  • Ensure M-Pesa is activated on the number\n  • Use format: *0712345678*\n  • Ensure you have sufficient balance\n\n━━━━━━━━━━━━━━━━━━━━\n  *1* → Retry M-Pesa\n  *2* → Pay by Card\n\n_*0* back · *6* menu_`,
       nextStep: 'choose_method', sessionData: data
     }
   }
@@ -941,17 +970,23 @@ async function doMpesa(data, body, phone) {
 function cardNumber(data, body) {
   const n = body.replace(/\s/g, '')
   if (!/^\d{16}$/.test(n)) {
-    return { text: `❌ Invalid. Enter your *16-digit card number* (no spaces):\n_*0* back | *6* menu_`, nextStep: 'card_number', sessionData: data }
+    return {
+      text: `❌ *Invalid Card Number*\n\nPlease enter all *16 digits* of your card number without spaces.\n\n  _(e.g. 4111 1111 1111 1111)_\n\n_*0* back · *6* menu_`,
+      nextStep: 'card_number', sessionData: data
+    }
   }
   return {
-    text: `✅ Card saved.\n\n*Step 2 of 3* — Enter *Expiry Date*:\n_(MM/YY — e.g. 12/26)_\n\n_*0* back | *6* menu_`,
+    text: `✅ *Card Number Saved*\n\n💳 *Step 2 of 3* — Enter your card *Expiry Date*:\n\n  _(MM/YY — e.g. 12/26)_\n\n_*0* back · *6* menu_`,
     nextStep: 'card_expiry', sessionData: { ...data, card_number: n }
   }
 }
 
 function cardExpiry(data, body) {
   if (!/^\d{2}\/\d{2}$/.test(body.trim())) {
-    return { text: `❌ Invalid. Enter expiry as *MM/YY*:\n_(e.g. 12/26)_\n\n_*0* back | *6* menu_`, nextStep: 'card_expiry', sessionData: data }
+    return {
+      text: `❌ *Invalid Expiry Date*\n\nPlease enter the date in MM/YY format.\n\n  _(e.g. 12/26)_\n\n_*0* back · *6* menu_`,
+      nextStep: 'card_expiry', sessionData: data
+    }
   }
   return {
     text: `✅ Expiry saved.\n\n*Step 3 of 3* — Enter your *CVV*:\n_(3-digit code on back of card)_\n\n_*0* back | *6* menu_`,
@@ -996,14 +1031,14 @@ async function cardCvv(data, body, phone) {
     }
 
     return {
-      text: `⏳ Payment processing...\nRef: *${ref}*\n\nYou will receive automatic confirmation with your remaining balance.\nType *0* for menu.`,
+      text: `⏳ *Payment Being Processed*\n━━━━━━━━━━━━━━━━━━━━\n\n  🔑 Reference: \`${ref}\`\n\nYour payment is being verified. Please wait a moment.\n\nYou will automatically receive a confirmation receipt here once it is approved.\n\n_Type *6* for main menu_`,
       nextStep: 'welcome', sessionData: {}
     }
   } catch (err) {
     const msg = err.response?.data?.message || 'Card declined'
     console.error('[CARD] Error:', msg)
     return {
-      text: `❌ *Card Failed*\n\n_${msg}_\n\n*2* retry card | *1* M-Pesa | _*0* back | *6* menu_`,
+      text: `❌ *Card Payment Failed*\n━━━━━━━━━━━━━━━━━━━━\n\n_${msg}_\n\nPlease try again or use a different payment method.\n\n  *1* → Try M-Pesa instead\n  *2* → Retry with card\n\n_*0* back · *6* menu_`,
       nextStep: 'choose_method', sessionData: { ...data, card_number: undefined, card_expiry: undefined }
     }
   }
