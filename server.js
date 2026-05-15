@@ -55,6 +55,11 @@ function generateRef() {
   return `SCH-${Date.now()}-${Math.random().toString(36).substr(2, 5).toUpperCase()}`
 }
 
+// Strip WhatsApp markdown so SMS arrives as clean plain text
+function stripMarkdown(text) {
+  return text.replace(/\*/g, '').replace(/_/g, '').replace(/━/g, '-').trim()
+}
+
 // ============================================================
 // SEND HELPERS
 // ============================================================
@@ -167,7 +172,7 @@ app.post('/webhook/sms', async (req, res) => {
     const session = await getSession(phone)
     const reply = await handleMessage(session, body, phone)
     await updateSession(phone, reply.nextStep, reply.sessionData || {})
-    await sendSMS(phone, reply.text)
+    await sendSMS(phone, stripMarkdown(reply.text))
   } catch (err) {
     console.error('SMS Bot error:', err.message, err.stack)
     await sendSMS(phone, 'Error. Text hi to restart.')
