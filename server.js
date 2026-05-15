@@ -206,7 +206,7 @@ async function handleUSSD(sessionId, phone, parts) {
   const p = (i) => parts[i] || ''
 
   if (depth === 0 || (depth === 1 && p(0) === '')) {
-    return 'CON Welcome to SchoolPay\n1. Pay Fees\n2. Check Balance\n0. Exit'
+    return 'CON Welcome to SchoolPay\n1. Pay Fees\n2. Check Balance\n3. Check Results\n0. Exit'
   }
 
   const choice = p(0)
@@ -353,6 +353,57 @@ async function handleUSSD(sessionId, phone, parts) {
     }
   }
 
+  // ── CHECK RESULTS (USSD) ──────────────────────────────────
+  if (choice === '3') {
+    if (depth === 1) return 'CON Enter admission number:'
+
+    if (depth === 2) {
+      const admission = p(1)
+      let student = null
+      try {
+        const { data: s } = await supabase.from('students')
+          .select('*, classes(name, stream)')
+          .eq('school_id', SCHOOL_ID).ilike('admission_number', admission).eq('is_active', true).single()
+        student = s
+      } catch (e) {}
+      if (!student) return `END Student "${admission}" not found.`
+
+      const year = new Date().getFullYear()
+      const { data: results } = await supabase.from('student_results')
+        .select('subject, exam_type, marks_scored, total_marks, term')
+        .eq('student_id', student.id).eq('year', year)
+        .order('subject')
+
+      if (!results || !results.length) return `END ${student.first_name} ${student.last_name}\nNo results found for ${year}.\n\nText results to get full report.`
+
+      // Group by subject, calculate averages
+      const bySubj = {}
+      results.forEach(r => {
+        if (!bySubj[r.subject]) bySubj[r.subject] = []
+        bySubj[r.subject].push(Math.round((r.marks_scored / r.total_marks) * 100))
+      })
+
+      const cls = student.classes ? `${student.classes.name}${student.classes.stream ? ' ' + student.classes.stream : ''}` : ''
+      let msg = `END ${student.first_name} ${student.last_name}${cls ? ' - ' + cls : ''}\n${year} Results:\n\n`
+
+      const allAvgs = []
+      Object.entries(bySubj).forEach(([subj, pcts]) => {
+        const avg = Math.round(pcts.reduce((a, b) => a + b, 0) / pcts.length)
+        const gr = gradeLabel(avg)
+        const short = subj.length > 12 ? subj.substring(0, 12) + '.' : subj
+        msg += `${short}: ${avg}% ${gr}\n`
+        allAvgs.push(avg)
+      })
+
+      if (allAvgs.length) {
+        const overall = Math.round(allAvgs.reduce((a, b) => a + b, 0) / allAvgs.length)
+        msg += `\nOverall: ${overall}% ${gradeLabel(overall)}`
+      }
+      msg += `\n\nText results for full breakdown.`
+      return msg
+    }
+  }
+
   return 'END Invalid option. Please try again.'
 }
 
@@ -400,6 +451,9 @@ async function handleMessage(session, body, phone) {
   // Balance — always works from any step
   if (lower === 'balance') return await showBalance(data, phone)
 
+  // Results — always works from any step
+  if (lower === 'results' || lower === 'r') return await showResults(data, phone)
+
   // Main menu — 6 or natural restart words
   if (['menu', '6', 'hi', 'hello', 'start', 'restart'].includes(lower)) {
     await resetSession(phone)
@@ -430,8 +484,9 @@ async function handleMessage(session, body, phone) {
     case 'ask_mpesa_phone': result = await doMpesa(data, body, phone); break
     case 'card_number':     result = cardNumber(data, body); break
     case 'card_expiry':     result = cardExpiry(data, body); break
-    case 'card_cvv':        result = await cardCvv(data, body, phone); break
-    default:                result = welcome()
+    case 'card_cvv':            result = await cardCvv(data, body, phone); break
+    case 'ask_results_adm':     result = await handleResultsAdmission(data, body); break
+    default:                    result = welcome()
   }
 
   // Push current step to history when advancing forward (not on errors or resets to welcome)
@@ -501,6 +556,141 @@ function getStepPrompt(step, data) {
 }
 
 // ============================================================
+// RESULTS HELPERS
+// ============================================================
+function gradeLabel(pct) {
+  if (pct >= 80) return 'A'
+  if (pct >= 65) return 'B'
+  if (pct >= 50) return 'C'
+  if (pct >= 35) return 'D'
+  return 'E'
+}
+
+function gradeRemark(pct) {
+  if (pct >= 80) return 'Excellent'
+  if (pct >= 65) return 'Good'
+  if (pct >= 50) return 'Average'
+  if (pct >= 35) return 'Below Average'
+  return 'Needs Improvement'
+}
+
+const EXAM_LABELS = { cat: 'CAT', opener: 'Opener', quiz: 'Quiz', midterm: 'Midterm', endterm: 'Endterm' }
+
+async function showResults(data, phone) {
+  if (!data.student_id) {
+    return {
+      text: `📊 *Academic Results*\n\nEnter the student's *Admission Number*:\n_(e.g. ADM/2025/001)_\n\n_*0* back | *6* menu_`,
+      nextStep: 'ask_results_adm',
+      sessionData: data
+    }
+  }
+  return await fetchResults(data.student_id)
+}
+
+async function handleResultsAdmission(data, body) {
+  let student = null
+  try {
+    const { data: s } = await supabase.from('students')
+      .select('*, classes(name, stream)')
+      .eq('school_id', SCHOOL_ID).ilike('admission_number', body.trim()).eq('is_active', true).single()
+    student = s
+  } catch (e) {}
+
+  if (!student) {
+    return {
+      text: `❌ Student *${body.trim()}* not found.\n\nCheck the admission number and try again.\n_*0* back | *6* menu_`,
+      nextStep: 'ask_results_adm',
+      sessionData: data
+    }
+  }
+  return await fetchResults(student.id)
+}
+
+async function fetchResults(studentId) {
+  try {
+    const { data: student } = await supabase.from('students')
+      .select('first_name, last_name, classes(name, stream)').eq('id', studentId).single()
+
+    const year = new Date().getFullYear()
+    const { data: results } = await supabase.from('student_results')
+      .select('subject, exam_type, marks_scored, total_marks, term, year')
+      .eq('student_id', studentId).eq('year', year)
+      .order('term').order('subject').order('exam_type')
+
+    const cls = student?.classes
+      ? `${student.classes.name}${student.classes.stream ? ' ' + student.classes.stream : ''}`
+      : ''
+    const name = `${student?.first_name} ${student?.last_name}`
+
+    if (!results || results.length === 0) {
+      return {
+        text: `📊 *Academic Results ${year}*\n\n👤 *${name}*${cls ? ` | ${cls}` : ''}\n\n_No results found for ${year}._\n\nResults are uploaded by the school's teachers.\n\n_Type *balance* for fees | *hi* for menu_`,
+        nextStep: 'welcome',
+        sessionData: { student_id: studentId }
+      }
+    }
+
+    // Group by term → subject → exams
+    const byTerm = {}
+    results.forEach(r => {
+      const tk = `Term ${r.term}`
+      if (!byTerm[tk]) byTerm[tk] = {}
+      if (!byTerm[tk][r.subject]) byTerm[tk][r.subject] = []
+      byTerm[tk][r.subject].push(r)
+    })
+
+    let msg = `📊 *Academic Results ${year}*\n\n`
+    msg += `👤 *${name}*${cls ? ` | ${cls}` : ''}\n`
+    const allPcts = []
+
+    Object.entries(byTerm).forEach(([termLabel, subjects]) => {
+      msg += `\n━━━━━━━━━━━━━━━━`
+      msg += `\n📅 *${termLabel}*\n`
+
+      Object.entries(subjects).forEach(([subject, exams]) => {
+        msg += `\n📚 *${subject}*`
+        let subSum = 0, subCount = 0
+        exams.forEach(e => {
+          const pct = Math.round((e.marks_scored / e.total_marks) * 100)
+          const gr = gradeLabel(pct)
+          const label = EXAM_LABELS[e.exam_type] || e.exam_type
+          msg += `\n  • ${label}: ${e.marks_scored}/${e.total_marks} → *${pct}% ${gr}*`
+          subSum += pct; subCount++; allPcts.push(pct)
+        })
+        if (subCount > 1) {
+          const avg = Math.round(subSum / subCount)
+          msg += `\n  _Avg: ${avg}% — ${gradeLabel(avg)} (${gradeRemark(avg)})_`
+        }
+      })
+    })
+
+    if (allPcts.length > 0) {
+      const overall = Math.round(allPcts.reduce((a, b) => a + b, 0) / allPcts.length)
+      const og = gradeLabel(overall)
+      msg += `\n\n━━━━━━━━━━━━━━━━`
+      msg += `\n📈 *Overall Average: ${overall}% — Grade ${og}*`
+      msg += `\n_${gradeRemark(overall)}_`
+      msg += `\n━━━━━━━━━━━━━━━━`
+    }
+
+    msg += `\n\n_Type *balance* for fees | *hi* to pay | *results* to refresh_`
+
+    return {
+      text: msg,
+      nextStep: 'welcome',
+      sessionData: { student_id: studentId }
+    }
+  } catch (err) {
+    console.error('fetchResults error:', err.message)
+    return {
+      text: `❌ Could not load results. Type *results* to retry or *hi* for menu.`,
+      nextStep: 'welcome',
+      sessionData: {}
+    }
+  }
+}
+
+// ============================================================
 // STEP HANDLERS
 // ============================================================
 async function showBalance(data, phone) {
@@ -547,7 +737,7 @@ async function showBalance(data, phone) {
 
 function welcome() {
   return {
-    text: `👋 *Welcome to SchoolPay!* 🏫\n\nPay school fees securely.\n\nPlease enter your *email address* for your payment receipt:\n📧 _(e.g. parent@gmail.com)_\n\n_At any point: *0* go back | *6* main menu | *balance* check fees_`,
+    text: `👋 *Welcome to SchoolPay!* 🏫\n\nPay school fees securely.\n\nPlease enter your *email address* for your payment receipt:\n📧 _(e.g. parent@gmail.com)_\n\n_Shortcuts: *balance* check fees | *results* academic results | *0* back | *6* menu_`,
     nextStep: 'ask_email', sessionData: {}
   }
 }
