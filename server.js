@@ -975,7 +975,7 @@ async function handleStatementAdm(data, body) {
 async function buildStatementMonthPicker(studentId, data) {
   try {
     const { data: payments } = await supabase.from('payments')
-      .select('created_at, amount, payment_method, paystack_reference, status')
+      .select('created_at, amount')
       .eq('student_id', studentId)
       .eq('status', 'success')
       .order('created_at', { ascending: false })
@@ -1041,19 +1041,25 @@ async function handleStatementMonth(data, n, raw) {
 
 async function fetchStatement(studentId, filterKey, data) {
   try {
-    let query = supabase.from('payments')
-      .select('amount, payment_method, paystack_reference, paid_by_email, created_at')
+    // Fetch confirmed payments from Supabase (status=success is set only by Paystack webhook)
+    const { data: payments } = await supabase.from('payments')
+      .select('amount, payment_method, paystack_reference, paystack_transaction_id, paid_by_email, paid_by_name, student_fee_id, created_at')
       .eq('student_id', studentId)
       .eq('status', 'success')
       .order('created_at', { ascending: false })
 
-    const { data: payments } = await query
     if (!payments || !payments.length) {
       return {
-        text: `📄 No payments found for this period.\n\n_Type *0* back · *6* menu_`,
+        text: `📄 *No Confirmed Payments*\n━━━━━━━━━━━━━━━━━━━━\n\n  👤 *${data.student_name || 'Student'}*\n\nNo Paystack-confirmed payments found for this student.\n\n_Type *1* to pay fees · *6* menu_`,
         nextStep: 'main_menu', sessionData: data
       }
     }
+
+    // Fetch fee names from v_student_fee_summary (keyed by student_fee_id)
+    const { data: feeSummary } = await supabase.from('v_student_fee_summary')
+      .select('student_fee_id, fee_name').eq('student_id', studentId)
+    const feeNames = {}
+    ;(feeSummary || []).forEach(f => { if (f.student_fee_id) feeNames[f.student_fee_id] = f.fee_name })
 
     // Filter by month key if set
     const filtered = filterKey
@@ -1071,13 +1077,17 @@ async function fetchStatement(studentId, filterKey, data) {
       }
     }
 
-    const periodLabel = filterKey ? (data._stmt_label || filterKey) : 'All Time'
-    const totalPaid   = filtered.reduce((s, p) => s + Number(p.amount), 0)
+    const periodLabel  = filterKey ? (data._stmt_label || filterKey) : 'All Time'
+    const totalPaid    = filtered.reduce((s, p) => s + Number(p.amount), 0)
+    const txnCount     = filtered.length
     const methodLabels = { mpesa: 'M-Pesa', card: 'Card', bank: 'Bank Transfer' }
 
-    let msg = `📄 *Statement — ${periodLabel}*\n━━━━━━━━━━━━━━━━━━━━\n\n`
-    msg += `  👤 *${data.student_name || 'Student'}*\n\n`
-    msg += `━━━━━━━━━━━━━━━━━━━━\n`
+    let msg = `📄 *Payment Statement*\n━━━━━━━━━━━━━━━━━━━━\n\n`
+    msg += `  👤 *${data.student_name || 'Student'}*\n`
+    if (data.student_class) msg += `  🏫 ${data.student_class}\n`
+    msg += `  📅 *${periodLabel}*\n`
+    msg += `  🔢 *${txnCount} confirmed payment${txnCount !== 1 ? 's' : ''} via Paystack*\n`
+    msg += `\n━━━━━━━━━━━━━━━━━━━━\n`
 
     // Group by month for "All time" view
     const byMonth = {}
@@ -1091,12 +1101,16 @@ async function fetchStatement(studentId, filterKey, data) {
     Object.entries(byMonth).forEach(([month, txns]) => {
       if (!filterKey) msg += `\n📅 *${month}*\n`
       txns.forEach(p => {
-        const d      = new Date(p.created_at)
-        const date   = d.toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })
-        const method = methodLabels[p.payment_method] || p.payment_method
-        msg += `\n  ✅ *KES ${Number(p.amount).toLocaleString()}*\n`
-        msg += `     ${method} · ${date}\n`
-        msg += `     Ref: \`${p.paystack_reference}\`\n`
+        const d        = new Date(p.created_at)
+        const date     = d.toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })
+        const time     = d.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' })
+        const method   = methodLabels[p.payment_method] || p.payment_method
+        const feeName  = feeNames[p.student_fee_id] || 'School Fee'
+        msg += `\n  ✅ *${feeName}*\n`
+        msg += `     💰 *KES ${Number(p.amount).toLocaleString()}*\n`
+        msg += `     📱 ${method}  ·  ${date} ${time}\n`
+        msg += `     🔑 Ref: \`${p.paystack_reference}\`\n`
+        if (p.paid_by_email) msg += `     📧 ${p.paid_by_email}\n`
       })
     })
 
