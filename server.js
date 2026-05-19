@@ -963,16 +963,60 @@ async function fetchResults(studentId, filterYear = null, filterTerm = null, ses
 async function generateTranscriptPDF(studentId, filterYear, filterTerm) {
   return new Promise(async (resolve, reject) => {
     try {
-      const doc = new PDFDocument({ margin: 50, size: 'A4' })
+      const doc = new PDFDocument({ margin: 0, size: 'A4', bufferPages: true })
       const chunks = []
       doc.on('data', c => chunks.push(c))
       doc.on('end',  () => resolve(Buffer.concat(chunks)))
       doc.on('error', reject)
 
-      const schoolName = process.env.SCHOOL_NAME || 'SchoolPay Academy'
-      const dateStr = new Date().toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric' })
+      // ── Palette ────────────────────────────────────────────────
+      const P = {
+        primary:   '#10b981',  // emerald
+        dark:      '#0f172a',  // near-black
+        slate:     '#1e293b',
+        text:      '#334155',
+        muted:     '#64748b',
+        light:     '#f8fafc',
+        border:    '#e2e8f0',
+        white:     '#ffffff',
+        gradeA:    '#065f46', gradeAbg: '#d1fae5',
+        gradeB:    '#1e40af', gradeBbg: '#dbeafe',
+        gradeC:    '#92400e', gradeCbg: '#fef3c7',
+        gradeD:    '#9a3412', gradeDbg: '#ffedd5',
+        gradeE:    '#991b1b', gradeEbg: '#fee2e2'
+      }
 
-      // Fetch student
+      const schoolName  = process.env.SCHOOL_NAME || 'SchoolPay'
+      const dateStr     = new Date().toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric' })
+      const B           = 'Helvetica-Bold'
+      const R           = 'Helvetica'
+      const L           = 40   // left margin
+      const W           = 515  // content width
+      const RX          = L + W // right edge
+
+      // Helpers
+      const gc = pct => pct >= 80 ? { t: P.gradeA, bg: P.gradeAbg }
+                      : pct >= 65 ? { t: P.gradeB, bg: P.gradeBbg }
+                      : pct >= 50 ? { t: P.gradeC, bg: P.gradeCbg }
+                      : pct >= 35 ? { t: P.gradeD, bg: P.gradeDbg }
+                      :             { t: P.gradeE, bg: P.gradeEbg }
+
+      const pill = (x, y, w, h, bg, text, fg, font, fs) => {
+        doc.roundedRect(x, y, w, h, 4).fill(bg)
+        doc.fillColor(fg).font(font).fontSize(fs)
+           .text(text, x, y + (h - fs) / 2 - 0.5, { width: w, align: 'center', lineBreak: false })
+      }
+
+      const row = (x, y, cols, rowH, even) => {
+        // cols: [{x, w, text, fg, font, fs, align}]
+        if (even) doc.rect(x, y, W, rowH).fill('#f8fafc')
+        cols.forEach(c => {
+          doc.fillColor(c.fg || P.text).font(c.font || R).fontSize(c.fs || 9)
+             .text(c.text, c.x, y + (rowH - (c.fs || 9)) / 2, { width: c.w, align: c.align || 'left', lineBreak: false })
+        })
+      }
+
+      // Fetch data
       const { data: student } = await supabase.from('students')
         .select('first_name, last_name, admission_number, classes(name, stream)')
         .eq('id', studentId).single()
@@ -981,7 +1025,6 @@ async function generateTranscriptPDF(studentId, filterYear, filterTerm) {
         ? `${student.classes.name}${student.classes.stream ? ' ' + student.classes.stream : ''}`
         : 'N/A'
 
-      // Fetch results
       let q = supabase.from('student_results')
         .select('subject, exam_type, marks_scored, total_marks, term, year')
         .eq('student_id', studentId)
@@ -991,40 +1034,75 @@ async function generateTranscriptPDF(studentId, filterYear, filterTerm) {
       const { data: results } = await q
 
       const periodLabel = filterYear
-        ? (filterTerm ? `Year ${filterYear} — Term ${filterTerm}` : `Year ${filterYear}`)
+        ? (filterTerm ? `Year ${filterYear}  ·  Term ${filterTerm}` : `Year ${filterYear}  ·  All Terms`)
         : 'All Academic Periods'
 
-      const H = { bold: 'Helvetica-Bold', reg: 'Helvetica', size: { h1: 16, h2: 12, h3: 10, body: 9, small: 8 } }
+      // ═══════════════════════════════════════════════════════
+      //  HEADER BAND
+      // ═══════════════════════════════════════════════════════
+      // Dark background
+      doc.rect(0, 0, 595, 110).fill(P.dark)
+      // Left accent strip
+      doc.rect(0, 0, 6, 110).fill(P.primary)
+      // School name
+      doc.fillColor(P.white).font(B).fontSize(22)
+         .text(schoolName.toUpperCase(), L + 6, 22, { width: W - 6, align: 'left' })
+      // Subtitle
+      doc.fillColor(P.primary).font(R).fontSize(10)
+         .text('OFFICIAL ACADEMIC TRANSCRIPT', L + 6, 52, { width: 300 })
+      // Date badge top-right
+      doc.roundedRect(RX - 130, 20, 130, 24, 4).fill('#1e293b')
+      doc.fillColor(P.muted).font(R).fontSize(8)
+         .text('ISSUED ON', RX - 125, 24, { width: 120, align: 'center' })
+      doc.fillColor(P.white).font(B).fontSize(8)
+         .text(dateStr, RX - 125, 33, { width: 120, align: 'center' })
 
-      // ── Header ──────────────────────────────────────────────
-      doc.rect(50, 40, 495, 80).fillAndStroke('#1e293b', '#1e293b')
-      doc.fillColor('white').font(H.bold).fontSize(H.size.h1)
-         .text(schoolName.toUpperCase(), 60, 52, { width: 475, align: 'center' })
-      doc.font(H.reg).fontSize(H.size.h2)
-         .text('OFFICIAL ACADEMIC TRANSCRIPT', 60, 76, { width: 475, align: 'center' })
-      doc.fillColor('black')
+      // ═══════════════════════════════════════════════════════
+      //  STUDENT INFO CARD
+      // ═══════════════════════════════════════════════════════
+      const cardY = 118
+      doc.rect(L, cardY, W, 62).fill('#f1f5f9')
+      doc.rect(L, cardY, 4, 62).fill(P.primary)
 
-      doc.moveDown(4)
+      doc.fillColor(P.muted).font(R).fontSize(7.5)
+      doc.text('STUDENT NAME',       L + 14, cardY + 8)
+      doc.text('ADMISSION NUMBER',   L + 200, cardY + 8)
+      doc.text('CLASS',              L + 340, cardY + 8)
 
-      // ── Student Info ─────────────────────────────────────────
-      const infoY = doc.y
-      doc.font(H.bold).fontSize(H.size.h3).text('STUDENT DETAILS', 50, infoY)
-      doc.moveTo(50, doc.y + 2).lineTo(545, doc.y + 2).strokeColor('#e2e8f0').lineWidth(1).stroke()
-      doc.moveDown(0.5)
+      doc.fillColor(P.slate).font(B).fontSize(11)
+      doc.text(sName,                                L + 14,  cardY + 20)
+      doc.text(student?.admission_number || 'N/A',   L + 200, cardY + 20)
+      doc.text(cls,                                  L + 340, cardY + 20)
 
-      const col1 = 50, col2 = 300
-      doc.font(H.reg).fontSize(H.size.body)
-      doc.font(H.bold).text('Name:', col1, doc.y, { continued: true }).font(H.reg).text(`  ${sName}`)
-      const row2y = doc.y
-      doc.font(H.bold).text('Admission No:', col1, row2y, { continued: true }).font(H.reg).text(`  ${student?.admission_number || 'N/A'}`)
-      doc.font(H.bold).text('Class:', col2, row2y, { continued: true }).font(H.reg).text(`  ${cls}`)
-      const row3y = doc.y
-      doc.font(H.bold).text('Period:', col1, row3y, { continued: true }).font(H.reg).text(`  ${periodLabel}`)
-      doc.font(H.bold).text('Date Issued:', col2, row3y, { continued: true }).font(H.reg).text(`  ${dateStr}`)
+      doc.fillColor(P.muted).font(R).fontSize(7.5)
+      doc.text('ACADEMIC PERIOD',    L + 14, cardY + 40)
+      doc.fillColor(P.slate).font(B).fontSize(9)
+      doc.text(periodLabel,          L + 14, cardY + 51)
 
-      doc.moveDown(1.5)
+      // ═══════════════════════════════════════════════════════
+      //  GRADE LEGEND
+      // ═══════════════════════════════════════════════════════
+      let y = cardY + 90
+      const legend = [
+        { g: 'A', label: 'Excellent  80–100%', ...gc(85) },
+        { g: 'B', label: 'Good  65–79%',       ...gc(70) },
+        { g: 'C', label: 'Average  50–64%',    ...gc(55) },
+        { g: 'D', label: 'Below Avg  35–49%',  ...gc(40) },
+        { g: 'E', label: 'Fail  0–34%',        ...gc(20) }
+      ]
+      doc.fillColor(P.muted).font(B).fontSize(7).text('GRADE SCALE', L, y)
+      y += 10
+      let lx = L
+      legend.forEach(l => {
+        pill(lx, y, 18, 14, l.bg, l.g, l.t, B, 7)
+        doc.fillColor(P.muted).font(R).fontSize(7).text(l.label, lx + 22, y + 4)
+        lx += 98
+      })
+      y += 24
 
-      // ── Results ───────────────────────────────────────────────
+      // ═══════════════════════════════════════════════════════
+      //  RESULTS
+      // ═══════════════════════════════════════════════════════
       const byYear = {}
       ;(results || []).forEach(r => {
         if (!byYear[r.year]) byYear[r.year] = {}
@@ -1035,103 +1113,153 @@ async function generateTranscriptPDF(studentId, filterYear, filterTerm) {
       })
 
       const allPcts = []
-      const colX = { exam: 60, score: 250, pct: 330, grade: 410 }
+      // Column X positions
+      const CX = { exam: L, score: L + 230, pct: L + 320, grade: L + 410 }
+      const CW = { exam: 225,  score: 85,   pct: 85,      grade: 105  }
+      const RH = 20  // row height
+      const TH = 18  // table header height
 
       Object.entries(byYear).sort((a, b) => b[0] - a[0]).forEach(([year, terms]) => {
+        // New page if near bottom
+        if (y > 720) { doc.addPage(); y = 40 }
+
         if (!filterYear) {
-          doc.font(H.bold).fontSize(H.size.h2).fillColor('#1e293b').text(`YEAR ${year}`)
-          doc.moveDown(0.3)
+          doc.rect(L, y, W, 22).fill(P.slate)
+          doc.fillColor(P.white).font(B).fontSize(11)
+             .text(`YEAR ${year}`, L + 10, y + 6, { width: W - 20 })
+          y += 28
         }
 
         Object.entries(terms).sort().forEach(([termLabel, subjects]) => {
-          doc.font(H.bold).fontSize(H.size.h3).fillColor('#059669').text(termLabel.toUpperCase())
-          doc.moveDown(0.3)
+          if (y > 700) { doc.addPage(); y = 40 }
+          // Term band
+          doc.rect(L, y, W, 20).fill(P.primary)
+          doc.fillColor(P.white).font(B).fontSize(9.5)
+             .text(termLabel.toUpperCase(), L + 10, y + 6, { width: W - 20 })
+          y += 26
 
           Object.entries(subjects).sort().forEach(([subject, exams]) => {
-            // Subject header bar
-            doc.rect(50, doc.y, 495, 16).fill('#f1f5f9')
-            doc.fillColor('#1e293b').font(H.bold).fontSize(H.size.body)
-               .text(subject.toUpperCase(), 55, doc.y - 13)
-            doc.moveDown(0.8)
+            if (y > 680) { doc.addPage(); y = 40 }
+
+            // Subject header
+            doc.rect(L, y, W, 18).fill('#e0f2fe')
+            doc.rect(L, y, 3, 18).fill('#0284c7')
+            doc.fillColor('#0c4a6e').font(B).fontSize(9)
+               .text(subject.toUpperCase(), L + 10, y + 5, { width: CW.exam })
+            y += 18
 
             // Column headers
-            const hY = doc.y
-            doc.fillColor('#64748b').font(H.bold).fontSize(H.size.small)
-            doc.text('Examination', colX.exam, hY)
-            doc.text('Score', colX.score, hY)
-            doc.text('Percentage', colX.pct, hY)
-            doc.text('Grade', colX.grade, hY)
-            doc.moveTo(50, doc.y + 1).lineTo(545, doc.y + 1).strokeColor('#e2e8f0').stroke()
-            doc.moveDown(0.4)
+            doc.rect(L, y, W, TH).fill('#f1f5f9')
+            ;[
+              { x: CX.exam,  w: CW.exam,  t: 'Examination'  },
+              { x: CX.score, w: CW.score, t: 'Score'         },
+              { x: CX.pct,   w: CW.pct,   t: 'Percentage'    },
+              { x: CX.grade, w: CW.grade, t: 'Grade'         }
+            ].forEach(h => {
+              doc.fillColor(P.muted).font(B).fontSize(7.5)
+                 .text(h.t, h.x + 5, y + 5, { width: h.w - 5 })
+            })
+            y += TH
 
             let subSum = 0, subCount = 0
-            exams.forEach((e, i) => {
+            exams.forEach((e, idx) => {
+              if (y > 730) { doc.addPage(); y = 40 }
               const pct   = Math.round((e.marks_scored / e.total_marks) * 100)
               const gr    = gradeLabel(pct)
               const label = EXAM_LABELS[e.exam_type] || e.exam_type
-              const grColor = pct >= 80 ? '#059669' : pct >= 65 ? '#2563eb' : pct >= 50 ? '#d97706' : '#dc2626'
-              const rowY = doc.y
+              const gC    = gc(pct)
 
-              doc.fillColor('#334155').font(H.reg).fontSize(H.size.body).text(label, colX.exam, rowY)
-              doc.text(`${e.marks_scored} / ${e.total_marks}`, colX.score, rowY)
-              doc.text(`${pct}%`, colX.pct, rowY)
-              doc.fillColor(grColor).font(H.bold).text(gr, colX.grade, rowY)
-              doc.fillColor('#334155').font(H.reg)
-              doc.moveDown(0.4)
+              // Alternating row
+              if (idx % 2 === 0) doc.rect(L, y, W, RH).fill(P.white)
+              else                doc.rect(L, y, W, RH).fill('#f8fafc')
 
+              doc.fillColor(P.text).font(R).fontSize(9)
+                 .text(label,                          CX.exam + 5,  y + 6, { width: CW.exam - 5,  lineBreak: false })
+                 .text(`${e.marks_scored} / ${e.total_marks}`, CX.score + 5, y + 6, { width: CW.score - 5, lineBreak: false })
+                 .text(`${pct}%`,                      CX.pct + 5,   y + 6, { width: CW.pct - 5,   lineBreak: false })
+
+              // Grade pill
+              pill(CX.grade + 10, y + 3, 38, 14, gC.bg, gr, gC.t, B, 9)
+              // % bar behind grade
+              const barW = Math.round((pct / 100) * (CW.grade - 60))
+              doc.rect(CX.grade + 55, y + 7, barW, 5).fill(gC.bg)
+              doc.rect(CX.grade + 55, y + 7, CW.grade - 60, 5).strokeColor(P.border).lineWidth(0.5).stroke()
+
+              y += RH
               subSum += pct; subCount++; allPcts.push(pct)
             })
 
+            // Subject average row
             const subAvg = Math.round(subSum / subCount)
-            const subGr  = gradeLabel(subAvg)
-            doc.moveTo(50, doc.y).lineTo(545, doc.y).strokeColor('#cbd5e1').stroke()
-            const avgY = doc.y + 3
-            doc.fillColor('#334155').font(H.bold).fontSize(H.size.body)
-            doc.text('Subject Average', colX.exam, avgY)
-            doc.text(`${subAvg}%`, colX.pct, avgY)
-            doc.fillColor(subAvg >= 80 ? '#059669' : subAvg >= 65 ? '#2563eb' : subAvg >= 50 ? '#d97706' : '#dc2626')
-               .text(subGr, colX.grade, avgY)
-            doc.fillColor('#334155')
-            doc.moveDown(1.2)
+            const sGC    = gc(subAvg)
+            doc.rect(L, y, W, RH + 2).fill(sGC.bg)
+            doc.fillColor(sGC.t).font(B).fontSize(8.5)
+               .text('Subject Average',       CX.exam + 5,  y + 6, { width: CW.exam, lineBreak: false })
+               .text(`${subAvg}%`,            CX.pct + 5,   y + 6, { width: CW.pct,  lineBreak: false })
+            pill(CX.grade + 10, y + 3, 38, 14, sGC.t, gradeLabel(subAvg), P.white, B, 9)
+            y += RH + 8
           })
-          doc.moveDown(0.5)
+          y += 8
         })
+        y += 4
       })
 
-      // ── Overall ───────────────────────────────────────────────
+      // ═══════════════════════════════════════════════════════
+      //  OVERALL PERFORMANCE BOX
+      // ═══════════════════════════════════════════════════════
       if (allPcts.length > 0) {
+        if (y > 700) { doc.addPage(); y = 40 }
         const overall = Math.round(allPcts.reduce((a, b) => a + b, 0) / allPcts.length)
-        const og = gradeLabel(overall)
-        const remark = gradeRemark(overall)
-        const bgColor = overall >= 80 ? '#ecfdf5' : overall >= 65 ? '#eff6ff' : overall >= 50 ? '#fffbeb' : '#fef2f2'
-        const txColor = overall >= 80 ? '#065f46' : overall >= 65 ? '#1e40af' : overall >= 50 ? '#92400e' : '#991b1b'
+        const og  = gradeLabel(overall)
+        const rem = gradeRemark(overall)
+        const oGC = gc(overall)
 
-        doc.moveDown(0.5)
-        doc.rect(50, doc.y, 495, 28).fill(bgColor)
-        const ovY = doc.y + 8
-        doc.fillColor(txColor).font(H.bold).fontSize(H.size.h3)
-           .text(`OVERALL AVERAGE: ${overall}%   ·   GRADE: ${og}   ·   ${remark.toUpperCase()}`, 55, ovY, { width: 485, align: 'center' })
-        doc.fillColor('#334155')
-        doc.moveDown(2)
+        y += 6
+        doc.rect(L, y, W, 56).fill(oGC.bg)
+        doc.rect(L, y, 5, 56).fill(oGC.t)
+
+        doc.fillColor(oGC.t).font(B).fontSize(10)
+           .text('OVERALL ACADEMIC PERFORMANCE', L + 16, y + 7, { width: W - 16 })
+        doc.font(B).fontSize(22)
+           .text(`${overall}%`, L + 16, y + 20, { continued: true })
+        doc.font(R).fontSize(11).fillColor(oGC.t)
+           .text(`   Grade: ${og}   ·   ${rem}`, { lineBreak: false })
+        y += 66
       }
 
-      // ── Footer ───────────────────────────────────────────────
-      doc.moveTo(50, doc.y).lineTo(545, doc.y).strokeColor('#e2e8f0').stroke()
-      doc.moveDown(0.8)
+      // ═══════════════════════════════════════════════════════
+      //  SIGNATURE AREA
+      // ═══════════════════════════════════════════════════════
+      if (y > 720) { doc.addPage(); y = 40 }
+      y += 10
+      doc.moveTo(L, y).lineTo(RX, y).strokeColor(P.border).lineWidth(0.8).stroke()
+      y += 12
 
-      const sigY = doc.y
-      doc.font(H.reg).fontSize(H.size.small).fillColor('#64748b')
-      doc.text("Principal's Signature: _______________________", col1, sigY)
-      doc.text('Date: _______________', col2 + 60, sigY)
-      doc.moveDown(0.6)
-      doc.text('School Stamp:', col1, doc.y)
-      doc.rect(doc.x + 5, doc.y - 12, 80, 35).strokeColor('#cbd5e1').lineWidth(0.5).stroke()
+      const sigBoxes = [
+        { label: "Principal's Signature", x: L,       w: 160 },
+        { label: 'Date',                  x: L + 180, w: 100 },
+        { label: 'School Stamp',          x: L + 300, w: 120 }
+      ]
+      sigBoxes.forEach(s => {
+        doc.fillColor(P.muted).font(R).fontSize(7.5).text(s.label, s.x, y)
+        doc.moveTo(s.x, y + 30).lineTo(s.x + s.w, y + 30).strokeColor('#cbd5e1').lineWidth(0.5).stroke()
+      })
 
-      doc.moveDown(2)
-      doc.font(H.reg).fontSize(H.size.small).fillColor('#94a3b8').text(
-        `This is an official academic transcript generated electronically by ${schoolName} via SchoolPay Academic Management System on ${dateStr}. For queries contact the school administration.`,
-        50, doc.y, { align: 'center', width: 495 }
-      )
+      // Stamp box
+      doc.roundedRect(L + 300, y + 2, 80, 40, 3).strokeColor('#cbd5e1').lineWidth(0.5).stroke()
+
+      y += 48
+
+      // ═══════════════════════════════════════════════════════
+      //  FOOTER
+      // ═══════════════════════════════════════════════════════
+      doc.rect(0, 800, 595, 42).fill(P.dark)
+      doc.rect(0, 800, 5, 42).fill(P.primary)
+      doc.fillColor(P.muted).font(R).fontSize(7.5)
+         .text(
+           `This document was generated electronically by ${schoolName} Academic Management System on ${dateStr}. It is an official transcript. For verification contact the school administration.`,
+           L + 6, 808, { width: W - 6, align: 'left' }
+         )
 
       doc.end()
     } catch (err) { reject(err) }
