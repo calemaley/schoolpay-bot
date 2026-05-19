@@ -1021,15 +1021,18 @@ async function handleTranscriptEmail(data, raw, phone) {
 }
 
 async function sendTranscriptAndConfirm(email, data, phone) {
-  const studentId = data._tx_student_id || data.student_id
-  const name      = data._tx_student_name || data.student_name || 'Student'
+  const studentId  = data._tx_student_id || data.student_id
+  const name       = data._tx_student_name || data.student_name || 'Student'
   const filterYear = data._tx_year  || null
   const filterTerm = data._tx_term  || null
 
-  await sendWA(phone, `⏳ *Generating your transcript...*\n\nThis may take a few seconds. Please wait.`)
+  console.log(`[TRANSCRIPT] Generating for student=${studentId} year=${filterYear} term=${filterTerm} email=${email}`)
 
   try {
-    const pdf      = await generateTranscriptPDF(studentId, filterYear, filterTerm)
+    const pdf = await Promise.race([
+      generateTranscriptPDF(studentId, filterYear, filterTerm),
+      new Promise((_, rej) => setTimeout(() => rej(new Error('PDF generation timed out after 30s')), 30000))
+    ])
     const safeName = name.replace(/\s+/g, '_')
     const period   = filterYear ? `${filterYear}${filterTerm ? '_T' + filterTerm : ''}` : 'AllYears'
     const fileName = `transcript_${safeName}_${period}_${Date.now()}.pdf`
@@ -1060,7 +1063,20 @@ async function sendTranscriptAndConfirm(email, data, phone) {
 // ============================================================
 
 async function generateTranscriptPDF(studentId, filterYear, filterTerm) {
-  return new Promise(async (resolve, reject) => {
+  // Fetch all data BEFORE creating the PDF document to avoid async inside Promise
+  const { data: student } = await supabase.from('students')
+    .select('first_name, last_name, admission_number, classes(name, stream)')
+    .eq('id', studentId).single()
+
+  let q = supabase.from('student_results')
+    .select('subject, exam_type, marks_scored, total_marks, term, year')
+    .eq('student_id', studentId)
+    .order('year', { ascending: false }).order('term').order('subject').order('exam_type')
+  if (filterYear) q = q.eq('year', filterYear)
+  if (filterTerm) q = q.eq('term', filterTerm)
+  const { data: results } = await q
+
+  return new Promise((resolve, reject) => {
     try {
       const doc = new PDFDocument({ margin: 0, size: 'A4', bufferPages: true })
       const chunks = []
@@ -1115,22 +1131,11 @@ async function generateTranscriptPDF(studentId, filterYear, filterTerm) {
         })
       }
 
-      // Fetch data
-      const { data: student } = await supabase.from('students')
-        .select('first_name, last_name, admission_number, classes(name, stream)')
-        .eq('id', studentId).single()
+      // Data already fetched before Promise (student + results variables from outer scope)
       const sName = `${student?.first_name || ''} ${student?.last_name || ''}`.trim()
       const cls   = student?.classes
         ? `${student.classes.name}${student.classes.stream ? ' ' + student.classes.stream : ''}`
         : 'N/A'
-
-      let q = supabase.from('student_results')
-        .select('subject, exam_type, marks_scored, total_marks, term, year')
-        .eq('student_id', studentId)
-        .order('year', { ascending: false }).order('term').order('subject').order('exam_type')
-      if (filterYear) q = q.eq('year', filterYear)
-      if (filterTerm) q = q.eq('term', filterTerm)
-      const { data: results } = await q
 
       const periodLabel = filterYear
         ? (filterTerm ? `Year ${filterYear}  ·  Term ${filterTerm}` : `Year ${filterYear}  ·  All Terms`)
@@ -1541,7 +1546,31 @@ async function dispatchPDF(pdfBuffer, fileName, toEmail, toPhone, subject, bodyT
 
 // ── Statement PDF generator ───────────────────────────────────
 async function generateStatementPDF(studentId, filterKey, periodLabel, sName, cls) {
-  return new Promise(async (resolve, reject) => {
+  // Fetch all data BEFORE creating the PDF doc to keep Promise synchronous
+  let q = supabase.from('payments')
+    .select('amount, payment_method, paystack_reference, paid_by_email, student_fee_id, created_at')
+    .eq('student_id', studentId).eq('status', 'success')
+    .order('created_at', { ascending: false })
+  const { data: payments } = await q
+
+  const { data: fs } = await supabase.from('v_student_fee_summary')
+    .select('student_fee_id, fee_name').eq('student_id', studentId)
+  const feeNames = {}
+  ;(fs || []).forEach(f => { if (f.student_fee_id) feeNames[f.student_fee_id] = f.fee_name })
+
+  const { data: stuRecord } = await supabase.from('students')
+    .select('admission_number').eq('id', studentId).single()
+
+  const filtered = filterKey
+    ? (payments || []).filter(p => {
+        const d = new Date(p.created_at)
+        return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}` === filterKey
+      })
+    : (payments || [])
+
+  const methodLabels = { mpesa: 'M-Pesa', card: 'Card', bank: 'Bank Transfer' }
+
+  return new Promise((resolve, reject) => {
     try {
       const doc = new PDFDocument({ margin: 0, size: 'A4' })
       const chunks = []
@@ -1549,32 +1578,10 @@ async function generateStatementPDF(studentId, filterKey, periodLabel, sName, cl
       doc.on('end', () => resolve(Buffer.concat(chunks)))
       doc.on('error', reject)
 
-      const school   = process.env.SCHOOL_NAME || 'SchoolPay'
-      const dateStr  = new Date().toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric' })
+      const school  = process.env.SCHOOL_NAME || 'SchoolPay'
+      const dateStr = new Date().toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric' })
       const B = 'Helvetica-Bold', R = 'Helvetica'
       const L = 40, W = 515, RX = L + W
-
-      // Fetch payments
-      let q = supabase.from('payments')
-        .select('amount, payment_method, paystack_reference, paid_by_email, student_fee_id, created_at')
-        .eq('student_id', studentId).eq('status', 'success')
-        .order('created_at', { ascending: false })
-      const { data: payments } = await q
-
-      // Fee names
-      const { data: fs } = await supabase.from('v_student_fee_summary')
-        .select('student_fee_id, fee_name').eq('student_id', studentId)
-      const feeNames = {}
-      ;(fs || []).forEach(f => { if (f.student_fee_id) feeNames[f.student_fee_id] = f.fee_name })
-
-      const filtered = filterKey
-        ? (payments || []).filter(p => {
-            const d = new Date(p.created_at)
-            return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}` === filterKey
-          })
-        : (payments || [])
-
-      const methodLabels = { mpesa: 'M-Pesa', card: 'Card', bank: 'Bank Transfer' }
 
       // ── HEADER ────────────────────────────────────────────────
       doc.rect(0, 0, 595, 108).fill('#0f172a')
@@ -1596,12 +1603,8 @@ async function generateStatementPDF(studentId, filterKey, periodLabel, sName, cl
          .text('STUDENT NAME', L + 15, y + 8).text('ADMISSION', L + 230, y + 8).text('CLASS', L + 380, y + 8)
       doc.fillColor('#1e293b').font(B).fontSize(12).text(sName, L + 15, y + 20)
       doc.fontSize(10)
-         .text(filtered[0] ? '' : 'N/A', L + 230, y + 22)
-      // pull adm number from first payment or student record
-      const { data: stu } = await supabase.from('students')
-        .select('admission_number').eq('id', studentId).single()
-      doc.text(stu?.admission_number || 'N/A', L + 230, y + 22)
-      doc.text(cls || 'N/A', L + 380, y + 22)
+         .text(stuRecord?.admission_number || 'N/A', L + 230, y + 22)
+         .text(cls || 'N/A', L + 380, y + 22)
       doc.fillColor('#64748b').font(R).fontSize(7.5).text('PERIOD', L + 15, y + 42)
       doc.fillColor('#1e293b').font(B).fontSize(9).text(periodLabel, L + 15, y + 52)
       y += 72
@@ -1710,7 +1713,19 @@ async function generateStatementPDF(studentId, filterKey, periodLabel, sName, cl
 
 // ── Balance PDF generator ──────────────────────────────────────
 async function generateBalancePDF(studentId, sName, cls) {
-  return new Promise(async (resolve, reject) => {
+  // Fetch all data BEFORE creating the PDF doc
+  const { data: allFees } = await supabase.from('v_student_fee_summary')
+    .select('*').eq('student_id', studentId).order('fee_category')
+  const outstanding = (allFees || []).filter(f => Number(f.balance) > 0)
+  const cleared     = (allFees || []).filter(f => Number(f.balance) <= 0)
+  const totalOwed   = outstanding.reduce((s, f) => s + Number(f.balance), 0)
+  const totalDue    = (allFees || []).reduce((s, f) => s + Number(f.amount_due || f.balance || 0), 0)
+  const totalPaid   = (allFees || []).reduce((s, f) => s + Number(f.amount_paid || 0), 0)
+  const paidPct     = totalDue > 0 ? Math.min(100, Math.round((totalPaid / totalDue) * 100)) : 0
+  const { data: stu } = await supabase.from('students')
+    .select('admission_number').eq('id', studentId).single()
+
+  return new Promise((resolve, reject) => {
     try {
       const doc = new PDFDocument({ margin: 0, size: 'A4' })
       const chunks = []
@@ -1722,18 +1737,6 @@ async function generateBalancePDF(studentId, sName, cls) {
       const dateStr = new Date().toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric' })
       const B = 'Helvetica-Bold', R = 'Helvetica'
       const L = 40, W = 515, RX = L + W
-
-      const { data: allFees } = await supabase.from('v_student_fee_summary')
-        .select('*').eq('student_id', studentId).order('fee_category')
-      const outstanding = (allFees || []).filter(f => Number(f.balance) > 0)
-      const cleared     = (allFees || []).filter(f => Number(f.balance) <= 0)
-      const totalOwed   = outstanding.reduce((s, f) => s + Number(f.balance), 0)
-      const totalDue    = (allFees || []).reduce((s, f) => s + Number(f.amount_due || f.balance || 0), 0)
-      const totalPaid   = (allFees || []).reduce((s, f) => s + Number(f.amount_paid || 0), 0)
-      const paidPct     = totalDue > 0 ? Math.min(100, Math.round((totalPaid / totalDue) * 100)) : 0
-
-      const { data: stu } = await supabase.from('students')
-        .select('admission_number').eq('id', studentId).single()
 
       // ── HEADER ────────────────────────────────────────────────
       // Gradient-like: layered rects
@@ -1920,10 +1923,13 @@ async function sendStmtPDF(email, data, phone) {
   const fk    = data._pdf_filter_key    || null
   const label = data._pdf_stmt_label    || 'All Time'
 
-  await sendWA(phone, `⏳ *Generating your PDF statement...*\nPlease wait a moment.`)
+  console.log(`[STMT PDF] Generating for student=${sid} label=${label} email=${email}`)
 
   try {
-    const pdf      = await generateStatementPDF(sid, fk, label, name, cls)
+    const pdf = await Promise.race([
+      generateStatementPDF(sid, fk, label, name, cls),
+      new Promise((_, rej) => setTimeout(() => rej(new Error('Statement PDF timed out after 30s')), 30000))
+    ])
     const fileName = `statement_${name.replace(/\s+/g,'_')}_${label.replace(/\s+/g,'_')}_${Date.now()}.pdf`
     const lines    = await dispatchPDF(pdf, fileName, email, phone,
       `Payment Statement — ${name}`,
@@ -1975,10 +1981,13 @@ async function sendBalancePDF(email, data, phone) {
   const cls  = data._pdf_student_class || data.student_class || ''
   const sid  = data._pdf_student_id    || data.student_id
 
-  await sendWA(phone, `⏳ *Generating your balance PDF...*\nPlease wait a moment.`)
+  console.log(`[BALANCE PDF] Generating for student=${sid} email=${email}`)
 
   try {
-    const pdf      = await generateBalancePDF(sid, name, cls)
+    const pdf = await Promise.race([
+      generateBalancePDF(sid, name, cls),
+      new Promise((_, rej) => setTimeout(() => rej(new Error('Balance PDF timed out after 30s')), 30000))
+    ])
     const fileName = `balance_${name.replace(/\s+/g,'_')}_${Date.now()}.pdf`
     const lines    = await dispatchPDF(pdf, fileName, email, phone,
       `Fee Balance Statement — ${name}`,
