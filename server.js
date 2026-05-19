@@ -1443,48 +1443,100 @@ async function dispatchTranscript(studentId, filterYear, filterTerm, toEmail, to
 // ── Shared PDF email/WA dispatch ─────────────────────────────
 async function dispatchPDF(pdfBuffer, fileName, toEmail, toPhone, subject, bodyText) {
   let emailSent = false, waSent = false, publicUrl = null
+  const school = process.env.SCHOOL_NAME || 'SchoolPay'
 
-  // Upload to Supabase Storage
+  // ── 1. Upload to Supabase Storage (needed for WhatsApp media) ──
   try {
-    const { data, error } = await supabase.storage
+    console.log(`[PDF] Uploading ${fileName} to storage…`)
+    const { data: upData, error: upErr } = await supabase.storage
       .from('transcripts')
       .upload(fileName, pdfBuffer, { contentType: 'application/pdf', upsert: true })
-    if (!error) {
-      const { data: { publicUrl: pu } } = supabase.storage.from('transcripts').getPublicUrl(data.path)
-      publicUrl = pu
+    if (upErr) {
+      console.error('[PDF] Storage upload error:', upErr.message)
+    } else {
+      const { data: urlData } = supabase.storage.from('transcripts').getPublicUrl(upData.path)
+      publicUrl = urlData?.publicUrl || null
+      console.log('[PDF] Storage upload OK. Public URL:', publicUrl)
     }
-  } catch (e) { console.error('[PDF] Storage error:', e.message) }
+  } catch (e) { console.error('[PDF] Storage exception:', e.message) }
 
-  // Email
-  if (process.env.EMAIL_USER && process.env.EMAIL_PASS) {
-    try {
-      await emailTransporter.sendMail({
-        from: `"${process.env.SCHOOL_NAME || 'SchoolPay'}" <${process.env.EMAIL_USER}>`,
-        to: toEmail, subject,
-        text: bodyText,
-        attachments: [{ filename: fileName, content: pdfBuffer, contentType: 'application/pdf' }]
-      })
-      emailSent = true
-    } catch (e) { console.error('[PDF] Email error:', e.message) }
+  // ── 2. Send Email with PDF attached ───────────────────────────
+  if (toEmail) {
+    if (!process.env.EMAIL_USER || !process.env.EMAIL_PASS) {
+      console.warn('[PDF] Email credentials missing — EMAIL_USER / EMAIL_PASS not set in Render env')
+    } else {
+      try {
+        console.log(`[PDF] Sending email to ${toEmail}…`)
+        await emailTransporter.sendMail({
+          from:    `"${school}" <${process.env.EMAIL_USER}>`,
+          to:      toEmail,
+          subject: subject,
+          text:    bodyText,
+          html:    `<p>${bodyText.replace(/\n/g, '<br>')}</p>`,
+          attachments: [{
+            filename:    fileName.split('/').pop(),   // just the filename, no path
+            content:     pdfBuffer,
+            contentType: 'application/pdf'
+          }]
+        })
+        emailSent = true
+        console.log('[PDF] Email sent OK')
+      } catch (e) {
+        console.error('[PDF] Email send error:', e.message, e.responseCode || '')
+      }
+    }
   }
 
-  // WhatsApp
-  if (toPhone && publicUrl) {
-    try {
-      await twilioClient.messages.create({
-        from: BOT_NUMBER, to: `whatsapp:${toE164(toPhone)}`,
-        body: `📄 *${subject}*\n\nYour PDF is ready. Tap below to download.`,
-        mediaUrl: [publicUrl]
-      })
-      waSent = true
-    } catch (e) { console.error('[PDF] WhatsApp error:', e.message) }
+  // ── 3. Send WhatsApp with PDF media (needs public URL) ────────
+  if (toPhone) {
+    const waNumber = `whatsapp:${toE164(toPhone)}`
+    if (publicUrl) {
+      try {
+        console.log(`[PDF] Sending WhatsApp media to ${waNumber}…`)
+        await twilioClient.messages.create({
+          from:     BOT_NUMBER,
+          to:       waNumber,
+          body:     `📄 *${subject}*\n\nYour PDF document is ready.\nTap the attachment to open or download it.`,
+          mediaUrl: [publicUrl]
+        })
+        waSent = true
+        console.log('[PDF] WhatsApp media sent OK')
+      } catch (e) {
+        console.error('[PDF] WhatsApp media error:', e.message)
+        // Fallback: send as text link
+        if (publicUrl) {
+          try {
+            await twilioClient.messages.create({
+              from: BOT_NUMBER, to: waNumber,
+              body: `📄 *${subject}*\n\nYour PDF is ready. Download here:\n${publicUrl}`
+            })
+            waSent = true
+            console.log('[PDF] WhatsApp text link sent as fallback')
+          } catch (e2) { console.error('[PDF] WhatsApp fallback error:', e2.message) }
+        }
+      }
+    } else if (emailSent) {
+      // No media URL — at least notify via WhatsApp that email was sent
+      try {
+        await twilioClient.messages.create({
+          from: BOT_NUMBER, to: waNumber,
+          body: `📄 *${subject}*\n\nYour PDF has been sent to *${toEmail}*. Please check your email inbox (and spam folder).`
+        })
+        waSent = true
+        console.log('[PDF] WhatsApp notification (email-only) sent OK')
+      } catch (e) { console.error('[PDF] WhatsApp notify error:', e.message) }
+    }
   }
 
+  // ── 4. Build delivery summary ─────────────────────────────────
   const lines = []
   if (emailSent) lines.push(`  📧 Email: *${toEmail}*`)
   if (waSent)    lines.push(`  📱 WhatsApp: sent to this number`)
-  if (!emailSent && !waSent && publicUrl) lines.push(`  🔗 ${publicUrl}`)
-  return lines.join('\n') || '  ⚠️ Could not deliver — check email settings.'
+  if (!emailSent && !waSent) {
+    if (!process.env.EMAIL_USER) lines.push(`  ⚠️ Email not configured — add EMAIL_USER & EMAIL_PASS to Render env`)
+    else                         lines.push(`  ⚠️ Delivery failed — check Render logs for details`)
+  }
+  return lines.join('\n')
 }
 
 // ── Statement PDF generator ───────────────────────────────────
