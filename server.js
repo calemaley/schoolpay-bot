@@ -58,7 +58,7 @@ function generateRef() {
 }
 
 // Email transporter (SMTP — set EMAIL_HOST, EMAIL_USER, EMAIL_PASS in Render env)
-const emailTransporter = nodemailer.createTransporter({
+const emailTransporter = nodemailer.createTransport({
   host:   process.env.EMAIL_HOST || 'smtp.gmail.com',
   port:   587,
   secure: false,
