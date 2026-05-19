@@ -7,6 +7,8 @@ const twilio = require('twilio')
 const AfricasTalking = require('africastalking')
 const axios = require('axios')
 const crypto = require('crypto')
+const PDFDocument = require('pdfkit')
+const nodemailer = require('nodemailer')
 require('dotenv').config()
 
 const app = express()
@@ -54,6 +56,14 @@ function toE164(raw) {
 function generateRef() {
   return `SCH-${Date.now()}-${Math.random().toString(36).substr(2, 5).toUpperCase()}`
 }
+
+// Email transporter (SMTP — set EMAIL_HOST, EMAIL_USER, EMAIL_PASS in Render env)
+const emailTransporter = nodemailer.createTransporter({
+  host:   process.env.EMAIL_HOST || 'smtp.gmail.com',
+  port:   587,
+  secure: false,
+  auth: { user: process.env.EMAIL_USER, pass: process.env.EMAIL_PASS }
+})
 
 // Strip WhatsApp markdown so SMS arrives as clean plain text
 function stripMarkdown(text) {
@@ -597,11 +607,14 @@ async function handleMessage(session, body, phone) {
     case 'card_number':         result = cardNumber(data, raw); break
     case 'card_expiry':         result = cardExpiry(data, raw); break
     case 'card_cvv':            result = await cardCvv(data, raw, phone); break
-    case 'ask_results_adm':     result = await handleResultsAdmission(data, raw); break
-    case 'pick_results_period': result = await handleResultsPeriod(data, n || raw); break
-    case 'ask_statement_adm':   result = await handleStatementAdm(data, raw); break
-    case 'pick_stmt_month':     result = await handleStatementMonth(data, n, raw); break
-    default:                    result = mainMenu(data)
+    case 'ask_results_adm':        result = await handleResultsAdmission(data, raw); break
+    case 'pick_results_period':    result = await handleResultsPeriod(data, n || raw); break
+    case 'ask_transcript_consent': result = await handleTranscriptConsent(data, n, phone); break
+    case 'confirm_transcript_email': result = await handleConfirmTranscriptEmail(data, n, phone); break
+    case 'ask_transcript_email':   result = await handleTranscriptEmail(data, raw, phone); break
+    case 'ask_statement_adm':      result = await handleStatementAdm(data, raw); break
+    case 'pick_stmt_month':        result = await handleStatementMonth(data, n, raw); break
+    default:                       result = mainMenu(data)
   }
 
   // ── History tracking ─────────────────────────────────────────
@@ -914,12 +927,24 @@ async function fetchResults(studentId, filterYear = null, filterTerm = null, ses
       msg += `━━━━━━━━━━━━━━━━━━━━`
     }
 
-    msg += `\n\n_Type *results* to view another period · *balance* for fees · *hi* for menu_`
+    msg += `\n━━━━━━━━━━━━━━━━━━━━\n`
+    msg += `📋 *Would you like an official PDF transcript?*\n\n`
+    msg += `  *Y* → Yes, send to my email & WhatsApp\n`
+    msg += `  *N* → No thanks\n\n`
+    msg += `_*6* main menu_`
 
     return {
       text: msg,
-      nextStep: 'main_menu',
-      sessionData: { student_id: studentId }
+      nextStep: 'ask_transcript_consent',
+      sessionData: {
+        ...sessionData,
+        student_id:       studentId,
+        _tx_student_id:   studentId,
+        _tx_year:         filterYear,
+        _tx_term:         filterTerm,
+        _tx_student_name: name,
+        _tx_class:        cls
+      }
     }
   } catch (err) {
     console.error('fetchResults error:', err.message)
@@ -928,6 +953,259 @@ async function fetchResults(studentId, filterYear = null, filterTerm = null, ses
       nextStep: 'main_menu',
       sessionData: {}
     }
+  }
+}
+
+// ============================================================
+// TRANSCRIPT — PDF GENERATION + DELIVERY
+// ============================================================
+
+async function generateTranscriptPDF(studentId, filterYear, filterTerm) {
+  return new Promise(async (resolve, reject) => {
+    try {
+      const doc = new PDFDocument({ margin: 50, size: 'A4' })
+      const chunks = []
+      doc.on('data', c => chunks.push(c))
+      doc.on('end',  () => resolve(Buffer.concat(chunks)))
+      doc.on('error', reject)
+
+      const schoolName = process.env.SCHOOL_NAME || 'SchoolPay Academy'
+      const dateStr = new Date().toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric' })
+
+      // Fetch student
+      const { data: student } = await supabase.from('students')
+        .select('first_name, last_name, admission_number, classes(name, stream)')
+        .eq('id', studentId).single()
+      const sName = `${student?.first_name || ''} ${student?.last_name || ''}`.trim()
+      const cls   = student?.classes
+        ? `${student.classes.name}${student.classes.stream ? ' ' + student.classes.stream : ''}`
+        : 'N/A'
+
+      // Fetch results
+      let q = supabase.from('student_results')
+        .select('subject, exam_type, marks_scored, total_marks, term, year')
+        .eq('student_id', studentId)
+        .order('year', { ascending: false }).order('term').order('subject').order('exam_type')
+      if (filterYear) q = q.eq('year', filterYear)
+      if (filterTerm) q = q.eq('term', filterTerm)
+      const { data: results } = await q
+
+      const periodLabel = filterYear
+        ? (filterTerm ? `Year ${filterYear} — Term ${filterTerm}` : `Year ${filterYear}`)
+        : 'All Academic Periods'
+
+      const H = { bold: 'Helvetica-Bold', reg: 'Helvetica', size: { h1: 16, h2: 12, h3: 10, body: 9, small: 8 } }
+
+      // ── Header ──────────────────────────────────────────────
+      doc.rect(50, 40, 495, 80).fillAndStroke('#1e293b', '#1e293b')
+      doc.fillColor('white').font(H.bold).fontSize(H.size.h1)
+         .text(schoolName.toUpperCase(), 60, 52, { width: 475, align: 'center' })
+      doc.font(H.reg).fontSize(H.size.h2)
+         .text('OFFICIAL ACADEMIC TRANSCRIPT', 60, 76, { width: 475, align: 'center' })
+      doc.fillColor('black')
+
+      doc.moveDown(4)
+
+      // ── Student Info ─────────────────────────────────────────
+      const infoY = doc.y
+      doc.font(H.bold).fontSize(H.size.h3).text('STUDENT DETAILS', 50, infoY)
+      doc.moveTo(50, doc.y + 2).lineTo(545, doc.y + 2).strokeColor('#e2e8f0').lineWidth(1).stroke()
+      doc.moveDown(0.5)
+
+      const col1 = 50, col2 = 300
+      doc.font(H.reg).fontSize(H.size.body)
+      doc.font(H.bold).text('Name:', col1, doc.y, { continued: true }).font(H.reg).text(`  ${sName}`)
+      const row2y = doc.y
+      doc.font(H.bold).text('Admission No:', col1, row2y, { continued: true }).font(H.reg).text(`  ${student?.admission_number || 'N/A'}`)
+      doc.font(H.bold).text('Class:', col2, row2y, { continued: true }).font(H.reg).text(`  ${cls}`)
+      const row3y = doc.y
+      doc.font(H.bold).text('Period:', col1, row3y, { continued: true }).font(H.reg).text(`  ${periodLabel}`)
+      doc.font(H.bold).text('Date Issued:', col2, row3y, { continued: true }).font(H.reg).text(`  ${dateStr}`)
+
+      doc.moveDown(1.5)
+
+      // ── Results ───────────────────────────────────────────────
+      const byYear = {}
+      ;(results || []).forEach(r => {
+        if (!byYear[r.year]) byYear[r.year] = {}
+        const tk = `Term ${r.term}`
+        if (!byYear[r.year][tk]) byYear[r.year][tk] = {}
+        if (!byYear[r.year][tk][r.subject]) byYear[r.year][tk][r.subject] = []
+        byYear[r.year][tk][r.subject].push(r)
+      })
+
+      const allPcts = []
+      const colX = { exam: 60, score: 250, pct: 330, grade: 410 }
+
+      Object.entries(byYear).sort((a, b) => b[0] - a[0]).forEach(([year, terms]) => {
+        if (!filterYear) {
+          doc.font(H.bold).fontSize(H.size.h2).fillColor('#1e293b').text(`YEAR ${year}`)
+          doc.moveDown(0.3)
+        }
+
+        Object.entries(terms).sort().forEach(([termLabel, subjects]) => {
+          doc.font(H.bold).fontSize(H.size.h3).fillColor('#059669').text(termLabel.toUpperCase())
+          doc.moveDown(0.3)
+
+          Object.entries(subjects).sort().forEach(([subject, exams]) => {
+            // Subject header bar
+            doc.rect(50, doc.y, 495, 16).fill('#f1f5f9')
+            doc.fillColor('#1e293b').font(H.bold).fontSize(H.size.body)
+               .text(subject.toUpperCase(), 55, doc.y - 13)
+            doc.moveDown(0.8)
+
+            // Column headers
+            const hY = doc.y
+            doc.fillColor('#64748b').font(H.bold).fontSize(H.size.small)
+            doc.text('Examination', colX.exam, hY)
+            doc.text('Score', colX.score, hY)
+            doc.text('Percentage', colX.pct, hY)
+            doc.text('Grade', colX.grade, hY)
+            doc.moveTo(50, doc.y + 1).lineTo(545, doc.y + 1).strokeColor('#e2e8f0').stroke()
+            doc.moveDown(0.4)
+
+            let subSum = 0, subCount = 0
+            exams.forEach((e, i) => {
+              const pct   = Math.round((e.marks_scored / e.total_marks) * 100)
+              const gr    = gradeLabel(pct)
+              const label = EXAM_LABELS[e.exam_type] || e.exam_type
+              const grColor = pct >= 80 ? '#059669' : pct >= 65 ? '#2563eb' : pct >= 50 ? '#d97706' : '#dc2626'
+              const rowY = doc.y
+
+              doc.fillColor('#334155').font(H.reg).fontSize(H.size.body).text(label, colX.exam, rowY)
+              doc.text(`${e.marks_scored} / ${e.total_marks}`, colX.score, rowY)
+              doc.text(`${pct}%`, colX.pct, rowY)
+              doc.fillColor(grColor).font(H.bold).text(gr, colX.grade, rowY)
+              doc.fillColor('#334155').font(H.reg)
+              doc.moveDown(0.4)
+
+              subSum += pct; subCount++; allPcts.push(pct)
+            })
+
+            const subAvg = Math.round(subSum / subCount)
+            const subGr  = gradeLabel(subAvg)
+            doc.moveTo(50, doc.y).lineTo(545, doc.y).strokeColor('#cbd5e1').stroke()
+            const avgY = doc.y + 3
+            doc.fillColor('#334155').font(H.bold).fontSize(H.size.body)
+            doc.text('Subject Average', colX.exam, avgY)
+            doc.text(`${subAvg}%`, colX.pct, avgY)
+            doc.fillColor(subAvg >= 80 ? '#059669' : subAvg >= 65 ? '#2563eb' : subAvg >= 50 ? '#d97706' : '#dc2626')
+               .text(subGr, colX.grade, avgY)
+            doc.fillColor('#334155')
+            doc.moveDown(1.2)
+          })
+          doc.moveDown(0.5)
+        })
+      })
+
+      // ── Overall ───────────────────────────────────────────────
+      if (allPcts.length > 0) {
+        const overall = Math.round(allPcts.reduce((a, b) => a + b, 0) / allPcts.length)
+        const og = gradeLabel(overall)
+        const remark = gradeRemark(overall)
+        const bgColor = overall >= 80 ? '#ecfdf5' : overall >= 65 ? '#eff6ff' : overall >= 50 ? '#fffbeb' : '#fef2f2'
+        const txColor = overall >= 80 ? '#065f46' : overall >= 65 ? '#1e40af' : overall >= 50 ? '#92400e' : '#991b1b'
+
+        doc.moveDown(0.5)
+        doc.rect(50, doc.y, 495, 28).fill(bgColor)
+        const ovY = doc.y + 8
+        doc.fillColor(txColor).font(H.bold).fontSize(H.size.h3)
+           .text(`OVERALL AVERAGE: ${overall}%   ·   GRADE: ${og}   ·   ${remark.toUpperCase()}`, 55, ovY, { width: 485, align: 'center' })
+        doc.fillColor('#334155')
+        doc.moveDown(2)
+      }
+
+      // ── Footer ───────────────────────────────────────────────
+      doc.moveTo(50, doc.y).lineTo(545, doc.y).strokeColor('#e2e8f0').stroke()
+      doc.moveDown(0.8)
+
+      const sigY = doc.y
+      doc.font(H.reg).fontSize(H.size.small).fillColor('#64748b')
+      doc.text("Principal's Signature: _______________________", col1, sigY)
+      doc.text('Date: _______________', col2 + 60, sigY)
+      doc.moveDown(0.6)
+      doc.text('School Stamp:', col1, doc.y)
+      doc.rect(doc.x + 5, doc.y - 12, 80, 35).strokeColor('#cbd5e1').lineWidth(0.5).stroke()
+
+      doc.moveDown(2)
+      doc.font(H.reg).fontSize(H.size.small).fillColor('#94a3b8').text(
+        `This is an official academic transcript generated electronically by ${schoolName} via SchoolPay Academic Management System on ${dateStr}. For queries contact the school administration.`,
+        50, doc.y, { align: 'center', width: 495 }
+      )
+
+      doc.end()
+    } catch (err) { reject(err) }
+  })
+}
+
+async function uploadTranscriptToStorage(pdfBuffer, fileName) {
+  try {
+    const { data, error } = await supabase.storage
+      .from('transcripts')
+      .upload(fileName, pdfBuffer, { contentType: 'application/pdf', upsert: true })
+    if (error) throw error
+    const { data: { publicUrl } } = supabase.storage.from('transcripts').getPublicUrl(data.path)
+    return publicUrl
+  } catch (err) {
+    console.error('[TRANSCRIPT] Storage upload error:', err.message)
+    return null
+  }
+}
+
+async function dispatchTranscript(studentId, filterYear, filterTerm, toEmail, toPhone, studentName, sessionData = {}) {
+  try {
+    console.log(`[TRANSCRIPT] Generating for ${studentName} → ${toEmail}`)
+    const pdfBuffer = await generateTranscriptPDF(studentId, filterYear, filterTerm)
+
+    const safeName = (studentName || 'Student').replace(/\s+/g, '_')
+    const period   = filterYear ? `${filterYear}${filterTerm ? '_T'+filterTerm : ''}` : 'AllYears'
+    const fileName = `transcript_${safeName}_${period}_${Date.now()}.pdf`
+
+    // Upload to Supabase Storage for WhatsApp media URL
+    const publicUrl = await uploadTranscriptToStorage(pdfBuffer, fileName)
+
+    // Send email with PDF attachment
+    let emailSent = false
+    if (process.env.EMAIL_USER && process.env.EMAIL_PASS) {
+      try {
+        const schoolName = process.env.SCHOOL_NAME || 'SchoolPay Academy'
+        await emailTransporter.sendMail({
+          from:    `"${schoolName}" <${process.env.EMAIL_USER}>`,
+          to:      toEmail,
+          subject: `Official Academic Transcript — ${studentName}`,
+          text:    `Dear Parent/Guardian,\n\nPlease find attached the official academic transcript for ${studentName}.\n\nThis document was generated by ${schoolName} via SchoolPay Academic Management System.\n\nFor queries, please contact the school administration.\n\nRegards,\n${schoolName}`,
+          html:    `<p>Dear Parent/Guardian,</p><p>Please find attached the official academic transcript for <strong>${studentName}</strong>.</p><p>This document was generated by <strong>${schoolName}</strong> via SchoolPay Academic Management System.</p><p>For queries, contact the school administration.</p><p>Regards,<br/>${schoolName}</p>`,
+          attachments: [{ filename: `${safeName}_Transcript.pdf`, content: pdfBuffer, contentType: 'application/pdf' }]
+        })
+        emailSent = true
+        console.log(`[TRANSCRIPT] Email sent to ${toEmail}`)
+      } catch (e) { console.error('[TRANSCRIPT] Email error:', e.message) }
+    }
+
+    // Send WhatsApp with media link
+    let waSent = false
+    if (toPhone && publicUrl) {
+      try {
+        await twilioClient.messages.create({
+          from: BOT_NUMBER,
+          to:   `whatsapp:${toE164(toPhone)}`,
+          body: `📄 *Official Academic Transcript*\n\nDear Parent, your transcript for *${studentName}* is ready.\n\n_Tap the link below to download the PDF:_`,
+          mediaUrl: [publicUrl]
+        })
+        waSent = true
+        console.log(`[TRANSCRIPT] WhatsApp sent to ${toPhone}`)
+      } catch (e) { console.error('[TRANSCRIPT] WhatsApp error:', e.message) }
+    }
+
+    const lines = []
+    if (emailSent) lines.push(`  📧 Email: *${toEmail}*`)
+    if (waSent)    lines.push(`  📱 WhatsApp: sent to this number`)
+    if (!emailSent && !waSent && publicUrl) lines.push(`  🔗 Download: ${publicUrl}`)
+
+    return lines.join('\n') || '  ⚠️ Delivery failed — check email credentials in server settings.'
+  } catch (err) {
+    console.error('[TRANSCRIPT] Dispatch error:', err.message)
+    throw err
   }
 }
 
