@@ -135,34 +135,41 @@ async function sendSMS(phone, message) {
 async function buildSuccessMessage(studentId, paidAmount, feeLabel, ref, email, guardianName, studentName) {
   let remainingSection = ''
   try {
-    const { data: remaining } = await supabase
+    // Fetch ALL fees for student (not pre-filtered) so we can accurately detect "all cleared"
+    const { data: allFees } = await supabase
       .from('v_student_fee_summary')
       .select('fee_name, balance, due_date')
       .eq('student_id', studentId)
-      .gt('balance', 0)
       .order('fee_category')
 
-    const outstanding = (remaining || []).filter(f => Number(f.balance) > 0)
-    const totalRemaining = outstanding.reduce((s, f) => s + Number(f.balance), 0)
-
-    if (outstanding.length === 0) {
-      remainingSection  = `\n\n🎊 *All school fees are now fully cleared!*`
-      remainingSection += `\nNo outstanding balance remaining. Well done! 🏆`
+    if (!allFees || allFees.length === 0) {
+      // No fee records found — don't assume all cleared; just prompt to check
+      remainingSection = `\n\n_Type *2* or *balance* to view your current fee balance._`
     } else {
-      remainingSection  = `\n\n📋 *Remaining Balance*\n`
-      outstanding.forEach((f, i) => {
-        remainingSection += `\n  ${i + 1}. ${f.fee_name}`
-        remainingSection += `\n     *KES ${Number(f.balance).toLocaleString()}*`
-        if (f.due_date) {
-          const due = new Date(f.due_date).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })
-          remainingSection += ` — _due ${due}_`
-        }
-      })
-      remainingSection += `\n\n💰 *Total Remaining: KES ${totalRemaining.toLocaleString()}*`
-      remainingSection += `\n\n_Kindly clear the remaining fees before the deadlines to avoid disruption to your child's studies._`
+      const outstanding = allFees.filter(f => Number(f.balance) > 0)
+      const totalRemaining = outstanding.reduce((s, f) => s + Number(f.balance), 0)
+
+      if (outstanding.length === 0) {
+        // We got records back and every single one is at 0 — genuinely all cleared
+        remainingSection  = `\n\n🎊 *All school fees are now fully cleared!*`
+        remainingSection += `\nNo outstanding balance remaining. Well done! 🏆`
+      } else {
+        remainingSection  = `\n\n📋 *Remaining Balance*\n`
+        outstanding.forEach((f, i) => {
+          remainingSection += `\n  ${i + 1}. ${f.fee_name}`
+          remainingSection += `\n     *KES ${Number(f.balance).toLocaleString()}*`
+          if (f.due_date) {
+            const due = new Date(f.due_date).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })
+            remainingSection += ` — _due ${due}_`
+          }
+        })
+        remainingSection += `\n\n💰 *Total Remaining: KES ${totalRemaining.toLocaleString()}*`
+        remainingSection += `\n\n_Please clear remaining fees before their deadlines._`
+      }
     }
   } catch (e) {
     console.error('buildSuccessMessage balance error:', e.message)
+    remainingSection = `\n\n_Type *2* or *balance* to view your current fee balance._`
   }
 
   let msg = ``
@@ -634,7 +641,7 @@ async function handleMessage(session, body, phone) {
 async function handleMainMenuChoice(data, n, raw, phone) {
   switch (n) {
     case '1': return {
-      text: `💳 *Pay Fees*\n━━━━━━━━━━━━━━━━━━━━\n\nPlease enter your *email address*.\nWe will send your payment receipt here.\n\n  📧 _(e.g. parent@gmail.com)_\n\n_*0* back · *6* menu_`,
+      text: `💳 *Pay Fees*\n━━━━━━━━━━━━━━━━━━━━\n\nPlease enter your *email address* to receive your payment receipt.\n\n  📧 _(e.g. parent@gmail.com)_\n\nNo email? Type *skip* — we'll use the school's email.\n\n_*0* back · *6* menu_`,
       nextStep: 'ask_email', sessionData: {}
     }
     case '2': {
@@ -1599,16 +1606,27 @@ function mainMenu(data = {}) {
 function welcome(data = {}) { return mainMenu(data) }
 
 function askEmail(data, body) {
-  const email = body.trim().toLowerCase()
-  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+  const raw   = body.trim().toLowerCase()
+  const DEFAULT_EMAIL = process.env.DEFAULT_RECEIPT_EMAIL || 'sirhenryslime@gmail.com'
+
+  // Allow parent to skip if they don't have an email — use the school default
+  const skipWords = ['skip', 'none', 'no', 'noemail', 'no email', 'dont have', "don't have", 'n/a']
+  if (skipWords.includes(raw)) {
     return {
-      text: `❌ *Invalid Email Address*\n\nThe email you entered doesn't appear to be valid.\nPlease try again.\n\n  📧 _(e.g. parent@gmail.com)_\n\n_*6* for main menu_`,
+      text: `✅ *No Problem!*\n\nWe will send your receipt to the school's default email:\n\n  📧 *${DEFAULT_EMAIL}*\n\nNow please enter the student's *Admission Number*.\n\n  🎓 _(e.g. ADM/2025/001)_\n\n_*0* back · *6* menu_`,
+      nextStep: 'ask_admission', sessionData: { email: DEFAULT_EMAIL, used_default_email: true }
+    }
+  }
+
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(raw)) {
+    return {
+      text: `❌ *Invalid Email Address*\n\nThe email you entered doesn't appear to be valid.\nPlease try again.\n\n  📧 _(e.g. parent@gmail.com)_\n\nDon't have an email? Type *skip* to use the school's email.\n\n_*6* for main menu_`,
       nextStep: 'ask_email', sessionData: {}
     }
   }
   return {
-    text: `✅ *Email Saved!*\n\n  📧 ${email}\n\nNow please enter the student's *Admission Number*.\n\n  🎓 _(e.g. ADM/2025/001)_\n\n_*0* back · *6* menu_`,
-    nextStep: 'ask_admission', sessionData: { email }
+    text: `✅ *Email Saved!*\n\n  📧 ${raw}\n\nNow please enter the student's *Admission Number*.\n\n  🎓 _(e.g. ADM/2025/001)_\n\n_*0* back · *6* menu_`,
+    nextStep: 'ask_admission', sessionData: { email: raw }
   }
 }
 
