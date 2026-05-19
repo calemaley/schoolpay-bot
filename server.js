@@ -619,9 +619,15 @@ async function handleMessage(session, body, phone) {
     case 'ask_transcript_consent': result = await handleTranscriptConsent(data, n, phone); break
     case 'confirm_transcript_email': result = await handleConfirmTranscriptEmail(data, n, phone); break
     case 'ask_transcript_email':   result = await handleTranscriptEmail(data, raw, phone); break
-    case 'ask_statement_adm':      result = await handleStatementAdm(data, raw); break
-    case 'pick_stmt_month':        result = await handleStatementMonth(data, n, raw); break
-    default:                       result = mainMenu(data)
+    case 'ask_statement_adm':        result = await handleStatementAdm(data, raw); break
+    case 'pick_stmt_month':          result = await handleStatementMonth(data, n, raw); break
+    case 'ask_stmt_pdf_consent':     result = await handleStmtPDFConsent(data, n, phone); break
+    case 'confirm_stmt_pdf_email':   result = await handleConfirmStmtPDFEmail(data, n, phone); break
+    case 'ask_stmt_pdf_email':       result = await handleStmtPDFEmail(data, raw, phone); break
+    case 'ask_balance_pdf_consent':  result = await handleBalancePDFConsent(data, n, phone); break
+    case 'confirm_balance_pdf_email': result = await handleConfirmBalancePDFEmail(data, n, phone); break
+    case 'ask_balance_pdf_email':    result = await handleBalancePDFEmail(data, raw, phone); break
+    default:                         result = mainMenu(data)
   }
 
   // ── History tracking ─────────────────────────────────────────
@@ -1345,17 +1351,519 @@ async function dispatchTranscript(studentId, filterYear, filterTerm, toEmail, to
 }
 
 // ============================================================
+// STATEMENT PDF + BALANCE PDF
+// ============================================================
+
+// ── Shared PDF email/WA dispatch ─────────────────────────────
+async function dispatchPDF(pdfBuffer, fileName, toEmail, toPhone, subject, bodyText) {
+  let emailSent = false, waSent = false, publicUrl = null
+
+  // Upload to Supabase Storage
+  try {
+    const { data, error } = await supabase.storage
+      .from('transcripts')
+      .upload(fileName, pdfBuffer, { contentType: 'application/pdf', upsert: true })
+    if (!error) {
+      const { data: { publicUrl: pu } } = supabase.storage.from('transcripts').getPublicUrl(data.path)
+      publicUrl = pu
+    }
+  } catch (e) { console.error('[PDF] Storage error:', e.message) }
+
+  // Email
+  if (process.env.EMAIL_USER && process.env.EMAIL_PASS) {
+    try {
+      await emailTransporter.sendMail({
+        from: `"${process.env.SCHOOL_NAME || 'SchoolPay'}" <${process.env.EMAIL_USER}>`,
+        to: toEmail, subject,
+        text: bodyText,
+        attachments: [{ filename: fileName, content: pdfBuffer, contentType: 'application/pdf' }]
+      })
+      emailSent = true
+    } catch (e) { console.error('[PDF] Email error:', e.message) }
+  }
+
+  // WhatsApp
+  if (toPhone && publicUrl) {
+    try {
+      await twilioClient.messages.create({
+        from: BOT_NUMBER, to: `whatsapp:${toE164(toPhone)}`,
+        body: `📄 *${subject}*\n\nYour PDF is ready. Tap below to download.`,
+        mediaUrl: [publicUrl]
+      })
+      waSent = true
+    } catch (e) { console.error('[PDF] WhatsApp error:', e.message) }
+  }
+
+  const lines = []
+  if (emailSent) lines.push(`  📧 Email: *${toEmail}*`)
+  if (waSent)    lines.push(`  📱 WhatsApp: sent to this number`)
+  if (!emailSent && !waSent && publicUrl) lines.push(`  🔗 ${publicUrl}`)
+  return lines.join('\n') || '  ⚠️ Could not deliver — check email settings.'
+}
+
+// ── Statement PDF generator ───────────────────────────────────
+async function generateStatementPDF(studentId, filterKey, periodLabel, sName, cls) {
+  return new Promise(async (resolve, reject) => {
+    try {
+      const doc = new PDFDocument({ margin: 0, size: 'A4' })
+      const chunks = []
+      doc.on('data', c => chunks.push(c))
+      doc.on('end', () => resolve(Buffer.concat(chunks)))
+      doc.on('error', reject)
+
+      const school   = process.env.SCHOOL_NAME || 'SchoolPay'
+      const dateStr  = new Date().toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric' })
+      const B = 'Helvetica-Bold', R = 'Helvetica'
+      const L = 40, W = 515, RX = L + W
+
+      // Fetch payments
+      let q = supabase.from('payments')
+        .select('amount, payment_method, paystack_reference, paid_by_email, student_fee_id, created_at')
+        .eq('student_id', studentId).eq('status', 'success')
+        .order('created_at', { ascending: false })
+      const { data: payments } = await q
+
+      // Fee names
+      const { data: fs } = await supabase.from('v_student_fee_summary')
+        .select('student_fee_id, fee_name').eq('student_id', studentId)
+      const feeNames = {}
+      ;(fs || []).forEach(f => { if (f.student_fee_id) feeNames[f.student_fee_id] = f.fee_name })
+
+      const filtered = filterKey
+        ? (payments || []).filter(p => {
+            const d = new Date(p.created_at)
+            return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}` === filterKey
+          })
+        : (payments || [])
+
+      const methodLabels = { mpesa: 'M-Pesa', card: 'Card', bank: 'Bank Transfer' }
+
+      // ── HEADER ────────────────────────────────────────────────
+      doc.rect(0, 0, 595, 108).fill('#0f172a')
+      doc.rect(0, 0, 6, 108).fill('#10b981')
+      doc.fillColor('white').font(B).fontSize(20).text(school.toUpperCase(), L + 8, 18, { width: W })
+      doc.fillColor('#10b981').font(R).fontSize(10).text('PAYMENT STATEMENT', L + 8, 48)
+      doc.fillColor('#64748b').font(R).fontSize(8.5)
+         .text(`Period: ${periodLabel}  ·  Generated: ${dateStr}`, L + 8, 64)
+      // Badge
+      doc.roundedRect(RX - 125, 20, 125, 30, 6).fill('#1e293b')
+      doc.fillColor('#64748b').font(R).fontSize(7).text('DOCUMENT DATE', RX - 120, 25, { width: 115, align: 'center' })
+      doc.fillColor('white').font(B).fontSize(8).text(dateStr, RX - 120, 35, { width: 115, align: 'center' })
+
+      // ── STUDENT CARD ──────────────────────────────────────────
+      let y = 118
+      doc.rect(L, y, W, 60).fill('#f1f5f9')
+      doc.rect(L, y, 5, 60).fill('#10b981')
+      doc.fillColor('#64748b').font(R).fontSize(7.5)
+         .text('STUDENT NAME', L + 15, y + 8).text('ADMISSION', L + 230, y + 8).text('CLASS', L + 380, y + 8)
+      doc.fillColor('#1e293b').font(B).fontSize(12).text(sName, L + 15, y + 20)
+      doc.fontSize(10)
+         .text(filtered[0] ? '' : 'N/A', L + 230, y + 22)
+      // pull adm number from first payment or student record
+      const { data: stu } = await supabase.from('students')
+        .select('admission_number').eq('id', studentId).single()
+      doc.text(stu?.admission_number || 'N/A', L + 230, y + 22)
+      doc.text(cls || 'N/A', L + 380, y + 22)
+      doc.fillColor('#64748b').font(R).fontSize(7.5).text('PERIOD', L + 15, y + 42)
+      doc.fillColor('#1e293b').font(B).fontSize(9).text(periodLabel, L + 15, y + 52)
+      y += 72
+
+      // ── TABLE ─────────────────────────────────────────────────
+      const CX = { date: L, fee: L + 105, method: L + 290, ref: L + 365, amt: L + 455 }
+      const CW = { date: 100, fee: 180, method: 70, ref: 85, amt: 60 }
+      const RH = 22
+
+      if (!filtered.length) {
+        y += 10
+        doc.rect(L, y, W, 50).fill('#fef3c7')
+        doc.fillColor('#92400e').font(B).fontSize(11)
+           .text('No confirmed payments found for this period.', L, y + 18, { width: W, align: 'center' })
+        y += 60
+      } else {
+        // Group by month
+        const byMonth = {}
+        filtered.forEach(p => {
+          const d   = new Date(p.created_at)
+          const mon = d.toLocaleDateString('en-GB', { month: 'long', year: 'numeric' })
+          if (!byMonth[mon]) byMonth[mon] = []
+          byMonth[mon].push(p)
+        })
+
+        Object.entries(byMonth).forEach(([month, txns]) => {
+          if (y > 710) { doc.addPage(); y = 40 }
+
+          // Month header
+          doc.rect(L, y, W, 24).fill('#1e293b')
+          doc.fillColor('white').font(B).fontSize(10).text(month.toUpperCase(), L + 12, y + 8)
+          y += 30
+
+          // Column headers
+          doc.rect(L, y, W, 18).fill('#f1f5f9')
+          ;[
+            { x: CX.date, w: CW.date, t: 'Date & Time' },
+            { x: CX.fee,  w: CW.fee,  t: 'Fee / Description' },
+            { x: CX.method, w: CW.method, t: 'Method' },
+            { x: CX.ref, w: CW.ref, t: 'Reference' },
+            { x: CX.amt, w: CW.amt, t: 'Amount (KES)' }
+          ].forEach(h => {
+            doc.fillColor('#64748b').font(B).fontSize(7.5)
+               .text(h.t, h.x + 4, y + 5, { width: h.w - 4, lineBreak: false })
+          })
+          y += 20
+
+          let monthTotal = 0
+          txns.forEach((p, idx) => {
+            if (y > 740) { doc.addPage(); y = 40 }
+            const d       = new Date(p.created_at)
+            const dStr    = d.toLocaleDateString('en-GB', { day: 'numeric', month: 'short' })
+            const tStr    = d.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' })
+            const feeName = feeNames[p.student_fee_id] || 'School Fee'
+            const method  = methodLabels[p.payment_method] || p.payment_method
+            const amt     = Number(p.amount)
+            monthTotal   += amt
+
+            doc.rect(L, y, W, RH).fill(idx % 2 === 0 ? 'white' : '#f8fafc')
+            doc.moveTo(L, y + RH).lineTo(RX, y + RH).strokeColor('#e2e8f0').lineWidth(0.4).stroke()
+
+            doc.fillColor('#334155').font(R).fontSize(8.5)
+               .text(`${dStr} ${tStr}`, CX.date + 4, y + 7, { width: CW.date - 4, lineBreak: false })
+               .text(feeName,           CX.fee + 4,  y + 7, { width: CW.fee - 4,  lineBreak: false })
+               .text(method,            CX.method + 4, y + 7, { width: CW.method - 4, lineBreak: false })
+            doc.fillColor('#94a3b8').font(R).fontSize(7)
+               .text((p.paystack_reference || '-').slice(0, 20), CX.ref + 4, y + 8, { width: CW.ref - 4, lineBreak: false })
+            doc.fillColor('#059669').font(B).fontSize(9)
+               .text(`${amt.toLocaleString()}`, CX.amt, y + 7, { width: CW.amt - 4, align: 'right', lineBreak: false })
+            // Paid dot
+            doc.circle(CX.date + 96, y + 11, 4).fill('#10b981')
+            y += RH
+          })
+
+          // Month total
+          doc.rect(L, y, W, 22).fill('#ecfdf5')
+          doc.fillColor('#065f46').font(B).fontSize(9)
+             .text('MONTH TOTAL', CX.date + 4, y + 7)
+             .text(`KES ${monthTotal.toLocaleString()}`, CX.amt, y + 7, { width: CW.amt - 4, align: 'right', lineBreak: false })
+          y += 30
+        })
+      }
+
+      // ── SUMMARY BOX ───────────────────────────────────────────
+      if (y > 700) { doc.addPage(); y = 40 }
+      const allTotal = filtered.reduce((s, p) => s + Number(p.amount), 0)
+      y += 10
+      doc.rect(L, y, W, 52).fill('#0f172a')
+      doc.rect(L, y, 5, 52).fill('#10b981')
+      doc.fillColor('white').font(B).fontSize(16)
+         .text(`TOTAL PAID: KES ${allTotal.toLocaleString()}`, L + 16, y + 10)
+      doc.fillColor('#64748b').font(R).fontSize(8.5)
+         .text(`${filtered.length} confirmed Paystack payment${filtered.length !== 1 ? 's' : ''}  ·  All amounts verified`, L + 16, y + 32)
+      y += 62
+
+      // ── FOOTER ────────────────────────────────────────────────
+      doc.rect(0, 800, 595, 42).fill('#0f172a')
+      doc.rect(0, 800, 5, 42).fill('#10b981')
+      doc.fillColor('#64748b').font(R).fontSize(7.5)
+         .text(`Official payment statement issued by ${school} via SchoolPay on ${dateStr}. For queries contact school administration.`, L + 8, 808, { width: W - 8 })
+
+      doc.end()
+    } catch (err) { reject(err) }
+  })
+}
+
+// ── Balance PDF generator ──────────────────────────────────────
+async function generateBalancePDF(studentId, sName, cls) {
+  return new Promise(async (resolve, reject) => {
+    try {
+      const doc = new PDFDocument({ margin: 0, size: 'A4' })
+      const chunks = []
+      doc.on('data', c => chunks.push(c))
+      doc.on('end', () => resolve(Buffer.concat(chunks)))
+      doc.on('error', reject)
+
+      const school  = process.env.SCHOOL_NAME || 'SchoolPay'
+      const dateStr = new Date().toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric' })
+      const B = 'Helvetica-Bold', R = 'Helvetica'
+      const L = 40, W = 515, RX = L + W
+
+      const { data: allFees } = await supabase.from('v_student_fee_summary')
+        .select('*').eq('student_id', studentId).order('fee_category')
+      const outstanding = (allFees || []).filter(f => Number(f.balance) > 0)
+      const cleared     = (allFees || []).filter(f => Number(f.balance) <= 0)
+      const totalOwed   = outstanding.reduce((s, f) => s + Number(f.balance), 0)
+      const totalDue    = (allFees || []).reduce((s, f) => s + Number(f.amount_due || f.balance || 0), 0)
+      const totalPaid   = (allFees || []).reduce((s, f) => s + Number(f.amount_paid || 0), 0)
+      const paidPct     = totalDue > 0 ? Math.min(100, Math.round((totalPaid / totalDue) * 100)) : 0
+
+      const { data: stu } = await supabase.from('students')
+        .select('admission_number').eq('id', studentId).single()
+
+      // ── HEADER ────────────────────────────────────────────────
+      // Gradient-like: layered rects
+      doc.rect(0, 0, 595, 108).fill('#0f172a')
+      doc.rect(0, 0, 6, 108).fill('#6366f1')
+      doc.fillColor('white').font(B).fontSize(20).text(school.toUpperCase(), L + 8, 18, { width: W })
+      doc.fillColor('#818cf8').font(R).fontSize(10).text('FEE BALANCE STATEMENT', L + 8, 48)
+      doc.fillColor('#64748b').font(R).fontSize(8.5).text(`As at: ${dateStr}`, L + 8, 64)
+      doc.roundedRect(RX - 125, 20, 125, 30, 6).fill('#1e293b')
+      doc.fillColor('#64748b').font(R).fontSize(7).text('STATEMENT DATE', RX - 120, 25, { width: 115, align: 'center' })
+      doc.fillColor('white').font(B).fontSize(8).text(dateStr, RX - 120, 35, { width: 115, align: 'center' })
+
+      // ── STUDENT CARD ──────────────────────────────────────────
+      let y = 118
+      doc.rect(L, y, W, 60).fill('#f1f5f9')
+      doc.rect(L, y, 5, 60).fill('#6366f1')
+      doc.fillColor('#64748b').font(R).fontSize(7.5)
+         .text('STUDENT NAME', L + 15, y + 8).text('ADMISSION', L + 230, y + 8).text('CLASS', L + 380, y + 8)
+      doc.fillColor('#1e293b').font(B).fontSize(12).text(sName, L + 15, y + 20)
+      doc.fontSize(10)
+         .text(stu?.admission_number || 'N/A', L + 230, y + 22)
+         .text(cls || 'N/A', L + 380, y + 22)
+      doc.fillColor('#64748b').font(R).fontSize(7.5).text('STATEMENT PERIOD', L + 15, y + 42)
+      doc.fillColor('#1e293b').font(B).fontSize(9).text(`Current Balance as at ${dateStr}`, L + 15, y + 52)
+      y += 72
+
+      // ── PROGRESS BAR ──────────────────────────────────────────
+      const barBg   = paidPct >= 100 ? '#10b981' : paidPct >= 60 ? '#6366f1' : paidPct >= 30 ? '#f59e0b' : '#ef4444'
+      doc.fillColor('#64748b').font(B).fontSize(8.5)
+         .text(`PAYMENT PROGRESS: ${paidPct}% of total fees paid`, L, y)
+      y += 14
+      doc.rect(L, y, W, 10).fill('#e2e8f0').rounded = true          // bg track
+      doc.rect(L, y, Math.max(8, Math.round((paidPct / 100) * W)), 10).fill(barBg) // fill
+      doc.fillColor('#334155').font(R).fontSize(8)
+         .text(`KES ${totalPaid.toLocaleString()} paid`, L, y + 14)
+         .text(`KES ${totalOwed.toLocaleString()} remaining`, RX - 150, y + 14, { width: 150, align: 'right' })
+      y += 40
+
+      // ── OUTSTANDING FEES ──────────────────────────────────────
+      if (outstanding.length > 0) {
+        doc.rect(L, y, W, 26).fill('#7c3aed')
+        doc.fillColor('white').font(B).fontSize(10).text('⚠  OUTSTANDING FEES', L + 12, y + 8)
+        y += 32
+
+        // Column headers
+        doc.rect(L, y, W, 18).fill('#faf5ff')
+        ;[
+          { x: L,        w: 200, t: 'Fee Name' },
+          { x: L + 205,  w: 90,  t: 'Amount Due' },
+          { x: L + 300,  w: 90,  t: 'Remaining' },
+          { x: L + 395,  w: 80,  t: 'Due Date' },
+          { x: L + 478,  w: 37,  t: 'Status' }
+        ].forEach(h => {
+          doc.fillColor('#7c3aed').font(B).fontSize(7.5)
+             .text(h.t, h.x + 4, y + 5, { width: h.w - 4, lineBreak: false })
+        })
+        y += 20
+
+        outstanding.forEach((f, idx) => {
+          if (y > 740) { doc.addPage(); y = 40 }
+          const balance  = Number(f.balance)
+          const amtDue   = Number(f.amount_due || balance)
+          const amtPaid  = Number(f.amount_paid || 0)
+          const due      = f.due_date
+            ? new Date(f.due_date).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: '2-digit' })
+            : 'N/A'
+          const isOverdue = f.due_date && new Date(f.due_date) < new Date()
+          const statusColor = isOverdue ? '#dc2626' : '#d97706'
+          const statusText  = isOverdue ? 'OVERDUE' : 'PENDING'
+
+          doc.rect(L, y, W, 24).fill(idx % 2 === 0 ? 'white' : '#faf5ff')
+          doc.moveTo(L, y + 24).lineTo(RX, y + 24).strokeColor('#ede9fe').lineWidth(0.4).stroke()
+
+          doc.fillColor('#334155').font(R).fontSize(9)
+             .text(f.fee_name, L + 4, y + 8, { width: 196, lineBreak: false })
+          doc.fillColor('#475569').fontSize(9)
+             .text(`KES ${amtDue.toLocaleString()}`,     L + 209, y + 8, { width: 86, align: 'right', lineBreak: false })
+          doc.fillColor('#7c3aed').font(B).fontSize(9)
+             .text(`KES ${balance.toLocaleString()}`,    L + 304, y + 8, { width: 86, align: 'right', lineBreak: false })
+          doc.fillColor('#64748b').font(R).fontSize(8).text(due, L + 399, y + 9, { width: 76, lineBreak: false })
+
+          // Status pill
+          doc.roundedRect(L + 479, y + 5, 36, 14, 3).fill(isOverdue ? '#fee2e2' : '#fef3c7')
+          doc.fillColor(statusColor).font(B).fontSize(6.5)
+             .text(statusText, L + 479, y + 9, { width: 36, align: 'center', lineBreak: false })
+          y += 24
+        })
+
+        // Outstanding total
+        doc.rect(L, y, W, 24).fill('#ede9fe')
+        doc.fillColor('#4c1d95').font(B).fontSize(10)
+           .text('TOTAL OUTSTANDING', L + 4, y + 7)
+           .text(`KES ${totalOwed.toLocaleString()}`, L + 304, y + 7, { width: 86, align: 'right', lineBreak: false })
+        y += 32
+      }
+
+      // ── CLEARED FEES ──────────────────────────────────────────
+      if (cleared.length > 0) {
+        if (y > 700) { doc.addPage(); y = 40 }
+        y += 8
+        doc.rect(L, y, W, 26).fill('#059669')
+        doc.fillColor('white').font(B).fontSize(10).text('✓  CLEARED FEES', L + 12, y + 8)
+        y += 32
+
+        cleared.forEach((f, idx) => {
+          if (y > 740) { doc.addPage(); y = 40 }
+          doc.rect(L, y, W, 22).fill(idx % 2 === 0 ? 'white' : '#f0fdf4')
+          // Check circle
+          doc.circle(L + 16, y + 11, 8).fill('#10b981')
+          doc.fillColor('white').font(B).fontSize(10).text('✓', L + 12, y + 6)
+          doc.fillColor('#334155').font(R).fontSize(9).text(f.fee_name, L + 30, y + 7, { width: 250, lineBreak: false })
+          doc.fillColor('#10b981').font(B).fontSize(8).text('FULLY PAID', RX - 80, y + 8, { width: 80, align: 'right', lineBreak: false })
+          y += 22
+        })
+        y += 8
+      }
+
+      // ── SUMMARY BOX ───────────────────────────────────────────
+      if (y > 700) { doc.addPage(); y = 40 }
+      y += 10
+      const summaryColor = totalOwed === 0 ? '#065f46' : '#1e293b'
+      const summaryBg    = totalOwed === 0 ? '#10b981' : '#6366f1'
+      doc.rect(L, y, W, 56).fill(summaryColor)
+      doc.rect(L, y, 5, 56).fill(summaryBg)
+      if (totalOwed === 0) {
+        doc.fillColor('white').font(B).fontSize(18).text('🎊  ALL FEES CLEARED!', L + 16, y + 12, { width: W - 20 })
+        doc.fillColor('#d1fae5').font(R).fontSize(9).text('No outstanding balance. Thank you!', L + 16, y + 36)
+      } else {
+        doc.fillColor('white').font(B).fontSize(16)
+           .text(`REMAINING: KES ${totalOwed.toLocaleString()}`, L + 16, y + 10)
+        doc.fillColor('#c7d2fe').font(R).fontSize(8.5)
+           .text(`Please clear the outstanding fees before their deadlines to avoid disruption to studies.`, L + 16, y + 34, { width: W - 32 })
+      }
+      y += 66
+
+      // ── FOOTER ────────────────────────────────────────────────
+      doc.rect(0, 800, 595, 42).fill('#0f172a')
+      doc.rect(0, 800, 5, 42).fill('#6366f1')
+      doc.fillColor('#64748b').font(R).fontSize(7.5)
+         .text(`Official fee balance statement issued by ${school} via SchoolPay on ${dateStr}. For queries contact school administration.`, L + 8, 808, { width: W - 8 })
+
+      doc.end()
+    } catch (err) { reject(err) }
+  })
+}
+
+// ── PDF consent/email handlers ────────────────────────────────
+async function handleStmtPDFConsent(data, n, phone) {
+  if (n === 'y' || n === 'yes') {
+    if (data.email) {
+      return {
+        text: `📧 Send PDF to *${data.email}*?\n\n  *Y* → Yes, use this email\n  *N* → Enter different email\n\n_*6* menu_`,
+        nextStep: 'confirm_stmt_pdf_email', sessionData: data
+      }
+    }
+    return {
+      text: `📧 Enter your *email address* to receive the statement PDF:\n\n  _(e.g. parent@gmail.com)_\n\nNo email? Type *skip* to use school's email.\n\n_*0* back · *6* menu_`,
+      nextStep: 'ask_stmt_pdf_email', sessionData: data
+    }
+  }
+  if (n === 'n' || n === 'no') return mainMenu(data)
+  return { text: `Type *Y* to receive the PDF or *N* to skip.\n\n_*6* menu_`, nextStep: 'ask_stmt_pdf_consent', sessionData: data }
+}
+
+async function handleConfirmStmtPDFEmail(data, n, phone) {
+  if (n === 'y' || n === 'yes') return await sendStmtPDF(data.email, data, phone)
+  return { text: `📧 Enter your email address:\n\n  _(e.g. parent@gmail.com)_\n\n_*0* back · *6* menu_`, nextStep: 'ask_stmt_pdf_email', sessionData: data }
+}
+
+async function handleStmtPDFEmail(data, raw, phone) {
+  const email = raw.trim().toLowerCase()
+  const DEFAULT = process.env.DEFAULT_RECEIPT_EMAIL || 'sirhenryslime@gmail.com'
+  const useEmail = ['skip','none','no','noemail'].includes(email) ? DEFAULT : email
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(useEmail)) {
+    return { text: `❌ Invalid email. Try again or type *skip* to use the school email.\n\n_*6* menu_`, nextStep: 'ask_stmt_pdf_email', sessionData: data }
+  }
+  return await sendStmtPDF(useEmail, data, phone)
+}
+
+async function sendStmtPDF(email, data, phone) {
+  const name  = data._pdf_student_name  || data.student_name  || 'Student'
+  const cls   = data._pdf_student_class || data.student_class || ''
+  const sid   = data._pdf_student_id    || data.student_id
+  const fk    = data._pdf_filter_key    || null
+  const label = data._pdf_stmt_label    || 'All Time'
+
+  await sendWA(phone, `⏳ *Generating your PDF statement...*\nPlease wait a moment.`)
+
+  try {
+    const pdf      = await generateStatementPDF(sid, fk, label, name, cls)
+    const fileName = `statement_${name.replace(/\s+/g,'_')}_${label.replace(/\s+/g,'_')}_${Date.now()}.pdf`
+    const lines    = await dispatchPDF(pdf, fileName, email, phone,
+      `Payment Statement — ${name}`,
+      `Please find attached the payment statement for ${name} (${label}).`)
+
+    return {
+      text: `✅ *Statement PDF Sent!*\n━━━━━━━━━━━━━━━━━━━━\n\n  👤 *${name}*\n  📅 ${label}\n\nDelivered to:\n${lines}\n\n_*6* main menu_`,
+      nextStep: 'main_menu', sessionData: data
+    }
+  } catch (err) {
+    return { text: `❌ PDF generation failed. Try again later.\n\n_*6* menu_`, nextStep: 'main_menu', sessionData: data }
+  }
+}
+
+async function handleBalancePDFConsent(data, n, phone) {
+  if (n === 'y' || n === 'yes') {
+    if (data.email) {
+      return {
+        text: `📧 Send PDF to *${data.email}*?\n\n  *Y* → Yes\n  *N* → Enter different email\n\n_*6* menu_`,
+        nextStep: 'confirm_balance_pdf_email', sessionData: data
+      }
+    }
+    return {
+      text: `📧 Enter your *email address* to receive the balance PDF:\n\n  _(e.g. parent@gmail.com)_\n\nNo email? Type *skip*.\n\n_*0* back · *6* menu_`,
+      nextStep: 'ask_balance_pdf_email', sessionData: data
+    }
+  }
+  if (n === 'n' || n === 'no') return mainMenu(data)
+  return { text: `Type *Y* to receive the PDF or *N* to skip.\n\n_*6* menu_`, nextStep: 'ask_balance_pdf_consent', sessionData: data }
+}
+
+async function handleConfirmBalancePDFEmail(data, n, phone) {
+  if (n === 'y' || n === 'yes') return await sendBalancePDF(data.email, data, phone)
+  return { text: `📧 Enter your email address:\n\n  _(e.g. parent@gmail.com)_\n\n_*0* back · *6* menu_`, nextStep: 'ask_balance_pdf_email', sessionData: data }
+}
+
+async function handleBalancePDFEmail(data, raw, phone) {
+  const email = raw.trim().toLowerCase()
+  const DEFAULT = process.env.DEFAULT_RECEIPT_EMAIL || 'sirhenryslime@gmail.com'
+  const useEmail = ['skip','none','no','noemail'].includes(email) ? DEFAULT : email
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(useEmail)) {
+    return { text: `❌ Invalid email. Try again or type *skip*.\n\n_*6* menu_`, nextStep: 'ask_balance_pdf_email', sessionData: data }
+  }
+  return await sendBalancePDF(useEmail, data, phone)
+}
+
+async function sendBalancePDF(email, data, phone) {
+  const name = data._pdf_student_name  || data.student_name  || 'Student'
+  const cls  = data._pdf_student_class || data.student_class || ''
+  const sid  = data._pdf_student_id    || data.student_id
+
+  await sendWA(phone, `⏳ *Generating your balance PDF...*\nPlease wait a moment.`)
+
+  try {
+    const pdf      = await generateBalancePDF(sid, name, cls)
+    const fileName = `balance_${name.replace(/\s+/g,'_')}_${Date.now()}.pdf`
+    const lines    = await dispatchPDF(pdf, fileName, email, phone,
+      `Fee Balance Statement — ${name}`,
+      `Please find attached the fee balance statement for ${name}.`)
+
+    return {
+      text: `✅ *Balance PDF Sent!*\n━━━━━━━━━━━━━━━━━━━━\n\n  👤 *${name}*\n\nDelivered to:\n${lines}\n\n_*hi* to pay fees · *6* main menu_`,
+      nextStep: 'main_menu', sessionData: data
+    }
+  } catch (err) {
+    return { text: `❌ PDF generation failed. Try again later.\n\n_*6* menu_`, nextStep: 'main_menu', sessionData: data }
+  }
+}
+
+// ============================================================
 // STATEMENTS
 // ============================================================
 async function showStatements(data, phone) {
-  const studentId = data.student_id
-  if (!studentId) {
-    return {
-      text: `📄 *Payment Statements*\n━━━━━━━━━━━━━━━━━━━━\n\nEnter the student's *Admission Number* to view their payment history:\n\n  🎓 _(e.g. ADM/2025/001)_\n\n_*0* back · *6* menu_`,
-      nextStep: 'ask_statement_adm', sessionData: data
-    }
+  // Always ask for admission — statements are per specific child
+  return {
+    text: `📄 *Payment Statements*\n━━━━━━━━━━━━━━━━━━━━\n\nEnter the student's *Admission Number* to view their payment records:\n\n  🎓 _(e.g. ADM/2025/001)_\n\n_*0* back · *6* menu_`,
+    nextStep: 'ask_statement_adm', sessionData: data
   }
-  return await buildStatementMonthPicker(studentId, data)
 }
 
 async function handleStatementAdm(data, body) {
@@ -1530,9 +2038,23 @@ async function fetchStatement(studentId, filterKey, data) {
     msg += `\n━━━━━━━━━━━━━━━━━━━━\n`
     msg += `💰 *Total Paid: KES ${totalPaid.toLocaleString()}*\n`
     msg += `━━━━━━━━━━━━━━━━━━━━\n\n`
-    msg += `_Type *0* for another period · *6* menu_`
+    msg += `📑 *Get a PDF copy of this statement?*\n\n`
+    msg += `  *Y* → Send to email & WhatsApp\n`
+    msg += `  *N* → No thanks\n\n`
+    msg += `_*0* another period · *6* menu_`
 
-    return { text: msg, nextStep: 'main_menu', sessionData: data }
+    return {
+      text: msg,
+      nextStep: 'ask_stmt_pdf_consent',
+      sessionData: {
+        ...data,
+        _pdf_student_id:   studentId,
+        _pdf_filter_key:   filterKey,
+        _pdf_stmt_label:   periodLabel,
+        _pdf_student_name: data.student_name,
+        _pdf_student_class: data.student_class
+      }
+    }
   } catch (err) {
     console.error('fetchStatement error:', err.message)
     return { text: `❌ Could not load statement. Type *statements* to retry.`, nextStep: 'main_menu', sessionData: data }
@@ -1582,9 +2104,20 @@ async function showBalance(data, phone) {
         msg += cleared.map(f => f.fee_name).join(', ')
       }
       msg += `\n━━━━━━━━━━━━━━━━━━━━\n\n`
-      msg += `_Type *hi* to pay now · *balance* to refresh_`
+      msg += `📑 *Get a PDF copy of this balance statement?*\n\n`
+      msg += `  *Y* → Send to email & WhatsApp\n`
+      msg += `  *N* → No thanks\n\n`
+      msg += `_*hi* to pay now · *6* menu_`
     }
-    return { text: msg, nextStep: 'main_menu', sessionData: { student_id: studentId } }
+    const sName = `${student?.first_name} ${student?.last_name}`
+    return {
+      text: msg,
+      nextStep: outstanding.length > 0 ? 'ask_balance_pdf_consent' : 'main_menu',
+      sessionData: {
+        student_id: studentId, student_name: sName, student_class: cls,
+        _pdf_student_id: studentId, _pdf_student_name: sName, _pdf_student_class: cls
+      }
+    }
   } catch (err) {
     console.error('showBalance error:', err.message)
     return { text: `❌ Could not load balance. Type *balance* to retry or *hi* to pay.`, nextStep: 'main_menu', sessionData: {} }
