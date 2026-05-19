@@ -970,6 +970,92 @@ async function fetchResults(studentId, filterYear = null, filterTerm = null, ses
 }
 
 // ============================================================
+// TRANSCRIPT — CONSENT + EMAIL HANDLERS
+// ============================================================
+async function handleTranscriptConsent(data, n, phone) {
+  if (n === 'y' || n === 'yes') {
+    // If they already provided an email when paying, offer to reuse it
+    if (data.email) {
+      return {
+        text: `📧 *Send Transcript*\n━━━━━━━━━━━━━━━━━━━━\n\nWe have *${data.email}* on file.\n\nSend transcript to this address?\n\n  *Y* → Yes, use this email\n  *N* → Enter a different email\n\n_*6* menu_`,
+        nextStep: 'confirm_transcript_email',
+        sessionData: data
+      }
+    }
+    return {
+      text: `📧 *Official Academic Transcript*\n━━━━━━━━━━━━━━━━━━━━\n\nEnter the *email address* to receive the transcript:\n\n  _(e.g. parent@gmail.com)_\n\nNo email? Type *skip* — we'll use the school's email.\n\n_*0* back · *6* menu_`,
+      nextStep: 'ask_transcript_email',
+      sessionData: data
+    }
+  }
+  if (n === 'n' || n === 'no') return mainMenu(data)
+  return {
+    text: `Please type *Y* to receive the transcript or *N* to skip.\n\n_*6* menu_`,
+    nextStep: 'ask_transcript_consent',
+    sessionData: data
+  }
+}
+
+async function handleConfirmTranscriptEmail(data, n, phone) {
+  if (n === 'y' || n === 'yes') return await sendTranscriptAndConfirm(data.email, data, phone)
+  return {
+    text: `📧 Enter the email address for the transcript:\n\n  _(e.g. parent@gmail.com)_\n\nNo email? Type *skip*.\n\n_*0* back · *6* menu_`,
+    nextStep: 'ask_transcript_email',
+    sessionData: data
+  }
+}
+
+async function handleTranscriptEmail(data, raw, phone) {
+  const email = raw.trim().toLowerCase()
+  const DEFAULT = process.env.DEFAULT_RECEIPT_EMAIL || 'sirhenryslime@gmail.com'
+  const useEmail = ['skip', 'none', 'no', 'noemail', "don't have", 'n/a'].includes(email) ? DEFAULT : email
+
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(useEmail)) {
+    return {
+      text: `❌ *Invalid Email*\n\nPlease enter a valid email address:\n\n  _(e.g. parent@gmail.com)_\n\nNo email? Type *skip*.\n\n_*0* back · *6* menu_`,
+      nextStep: 'ask_transcript_email',
+      sessionData: data
+    }
+  }
+  return await sendTranscriptAndConfirm(useEmail, data, phone)
+}
+
+async function sendTranscriptAndConfirm(email, data, phone) {
+  const studentId = data._tx_student_id || data.student_id
+  const name      = data._tx_student_name || data.student_name || 'Student'
+  const filterYear = data._tx_year  || null
+  const filterTerm = data._tx_term  || null
+
+  await sendWA(phone, `⏳ *Generating your transcript...*\n\nThis may take a few seconds. Please wait.`)
+
+  try {
+    const pdf      = await generateTranscriptPDF(studentId, filterYear, filterTerm)
+    const safeName = name.replace(/\s+/g, '_')
+    const period   = filterYear ? `${filterYear}${filterTerm ? '_T' + filterTerm : ''}` : 'AllYears'
+    const fileName = `transcript_${safeName}_${period}_${Date.now()}.pdf`
+
+    const lines = await dispatchPDF(
+      pdf, fileName, email, phone,
+      `Official Academic Transcript — ${name}`,
+      `Dear Parent/Guardian,\n\nPlease find attached the official academic transcript for ${name}.\n\nFor queries, contact the school administration.\n\nRegards,\n${process.env.SCHOOL_NAME || 'SchoolPay'}`
+    )
+
+    return {
+      text: `✅ *Transcript Sent!*\n━━━━━━━━━━━━━━━━━━━━\n\n  👤 *${name}*\n  📄 Period: ${filterYear ? `Year ${filterYear}${filterTerm ? ' — Term ' + filterTerm : ''}` : 'All Years'}\n\nDelivered to:\n${lines}\n\n━━━━━━━━━━━━━━━━━━━━\n_Type *results* for another period · *6* menu_`,
+      nextStep: 'main_menu',
+      sessionData: data
+    }
+  } catch (err) {
+    console.error('[TRANSCRIPT] Error:', err.message)
+    return {
+      text: `❌ *Transcript Generation Failed*\n\nWe could not generate the PDF at this time.\nPlease try again later.\n\n_Type *results* to retry · *6* menu_`,
+      nextStep: 'main_menu',
+      sessionData: data
+    }
+  }
+}
+
+// ============================================================
 // TRANSCRIPT — PDF GENERATION + DELIVERY
 // ============================================================
 
