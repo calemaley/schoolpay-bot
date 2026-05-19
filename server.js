@@ -60,6 +60,40 @@ function stripMarkdown(text) {
   return text.replace(/\*/g, '').replace(/_/g, '').replace(/━/g, '-').trim()
 }
 
+// ── Typo-tolerant input normaliser ───────────────────────────
+function normalizeInput(raw) {
+  const s = raw.toLowerCase().trim().replace(/[!?.]+$/, '').trim()
+
+  // Greetings / restart
+  if (/^(hi+|hey+|hello+|helo|hii|start|restart|begin|home)$/.test(s)) return 'hi'
+
+  // Menu numbers — tolerate trailing punctuation already stripped above
+  if (/^1$/.test(s)) return '1'
+  if (/^2$/.test(s)) return '2'
+  if (/^3$/.test(s)) return '3'
+  if (/^4$/.test(s)) return '4'
+  if (/^0$/.test(s)) return '0'
+  if (/^6$/.test(s)) return '6'
+  if (/^all$/.test(s)) return 'all'
+
+  // Back / go back
+  if (/^(back|bck|bak|bac|bakc|go\s*back)$/.test(s)) return '0'
+
+  // Menu
+  if (/^(menu|mnu|men|main|maenu|meun)$/.test(s)) return '6'
+
+  // Balance
+  if (/^(balance|balanc|balan|bal|balence|blance|ballance|check\s*balance|my\s*balance|fees)$/.test(s)) return 'balance'
+
+  // Results
+  if (/^(results|result|resuts|resulst|rsults|rezults|resukt|resulr|check\s*results|my\s*results)$/.test(s)) return 'results'
+
+  // Statements
+  if (/^(statements|statement|statment|statemnt|statemnts|stmt|transactions|history|trx|trans)$/.test(s)) return 'statements'
+
+  return s
+}
+
 // ============================================================
 // SEND HELPERS
 // ============================================================
@@ -216,7 +250,7 @@ async function handleUSSD(sessionId, phone, parts) {
   const p = (i) => parts[i] || ''
 
   if (depth === 0 || (depth === 1 && p(0) === '')) {
-    return 'CON Welcome to SchoolPay\n1. Pay Fees\n2. Check Balance\n3. Check Results\n0. Exit'
+    return 'CON Welcome to SchoolPay\n1. Pay Fees\n2. Check Balance\n3. Check Results\n4. Statements\n0. Exit'
   }
 
   const choice = p(0)
@@ -445,6 +479,44 @@ async function handleUSSD(sessionId, phone, parts) {
     }
   }
 
+  // ── STATEMENTS (USSD) ────────────────────────────────────────
+  if (choice === '4') {
+    if (depth === 1) return 'CON Enter admission number:'
+
+    if (depth === 2) {
+      const admission = p(1)
+      let student = null
+      try {
+        const { data: s } = await supabase.from('students')
+          .select('id, first_name, last_name')
+          .eq('school_id', SCHOOL_ID).ilike('admission_number', admission).eq('is_active', true).single()
+        student = s
+      } catch (e) {}
+      if (!student) return `END Student "${admission}" not found.\nCheck and try again.`
+
+      const { data: payments } = await supabase.from('payments')
+        .select('amount, payment_method, created_at')
+        .eq('student_id', student.id).eq('status', 'success')
+        .order('created_at', { ascending: false })
+
+      if (!payments || !payments.length) {
+        return `END ${student.first_name} ${student.last_name}\nNo payment records found.\n\nText hi to pay fees.`
+      }
+
+      const total = payments.reduce((s, p) => s + Number(p.amount), 0)
+      const methodLabels = { mpesa: 'MPesa', card: 'Card', bank: 'Bank' }
+      let msg = `END ${student.first_name} ${student.last_name}\nPayment History:\n\n`
+      payments.slice(0, 5).forEach(p => {
+        const d = new Date(p.created_at).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: '2-digit' })
+        const m = methodLabels[p.payment_method] || p.payment_method
+        msg += `${d} KES ${Number(p.amount).toLocaleString()} ${m}\n`
+      })
+      if (payments.length > 5) msg += `...+${payments.length - 5} more\n`
+      msg += `\nTotal: KES ${total.toLocaleString()}\n\nText statements for full report.`
+      return msg
+    }
+  }
+
   return 'END Invalid option. Please try again.'
 }
 
@@ -484,71 +556,96 @@ async function savePendingUSSD(ussdData, ref, method) {
 // MESSAGE HANDLER — shared by WhatsApp + SMS
 // ============================================================
 async function handleMessage(session, body, phone) {
-  const lower = body.toLowerCase().trim()
-  const step = session.current_step || 'welcome'
-  const data = session.session_data || {}
-  const hist = data._hist || []
+  const n    = normalizeInput(body)   // typo-tolerant normalised version
+  const raw  = body.trim()            // original text (for free-form inputs)
+  const step = session.current_step || 'main_menu'
+  const data = session.session_data  || {}
+  const hist = data._hist            || []
 
-  // Balance — always works from any step
-  if (lower === 'balance') return await showBalance(data, phone)
+  // ── Always-available shortcuts (work from any step) ──────────
+  if (n === 'balance')    return await showBalance(data, phone)
+  if (n === 'results')    return await showResults(data, phone)
+  if (n === 'statements') return await showStatements(data, phone)
 
-  // Results — always works from any step
-  if (lower === 'results' || lower === 'r') return await showResults(data, phone)
-
-  // Main menu — 6 or natural restart words
-  if (['menu', '6', 'hi', 'hello', 'start', 'restart'].includes(lower)) {
+  // ── Main menu / restart ──────────────────────────────────────
+  if (n === 'hi' || n === '6' || n === 'menu') {
     await resetSession(phone)
-    return welcome()
+    // Welcome back if student already identified in previous session
+    if (data.student_id || data.student_name) {
+      return mainMenu(data)   // carries name for personalised greeting
+    }
+    return mainMenu({})
   }
 
-  // Go back one step — 0 or back
-  if (['back', 'b', '0'].includes(lower)) {
-    if (hist.length === 0) {
-      return {
-        text: `You're already at the start 😊\n\nType *hi* to begin\nType *balance* to check fees`,
-        nextStep: 'welcome', sessionData: {}
-      }
-    }
+  // ── Go back one step ─────────────────────────────────────────
+  if (n === '0' || n === 'back') {
+    if (hist.length === 0) return mainMenu(data)
     const prev = hist[hist.length - 1]
     const restoredData = { ...prev.data, _hist: hist.slice(0, -1) }
     return getStepPrompt(prev.step, restoredData)
   }
 
-  // Process current step
+  // ── Process current step ─────────────────────────────────────
   let result
   switch (step) {
-    case 'welcome':         result = welcome(); break
-    case 'ask_email':       result = askEmail(data, body); break
-    case 'ask_admission':   result = await askAdmission(data, body); break
-    case 'show_fees':       result = showFees(data, body); break
-    case 'choose_method':   result = chooseMethod(data, body); break
-    case 'ask_mpesa_phone': result = await doMpesa(data, body, phone); break
-    case 'card_number':     result = cardNumber(data, body); break
-    case 'card_expiry':     result = cardExpiry(data, body); break
-    case 'card_cvv':            result = await cardCvv(data, body, phone); break
-    case 'ask_results_adm':     result = await handleResultsAdmission(data, body); break
-    case 'pick_results_period': result = await handleResultsPeriod(data, body); break
-    default:                    result = welcome()
+    case 'main_menu':           result = await handleMainMenuChoice(data, n, raw, phone); break
+    case 'ask_email':           result = askEmail(data, raw); break
+    case 'ask_admission':       result = await askAdmission(data, raw); break
+    case 'show_fees':           result = showFees(data, raw); break
+    case 'choose_method':       result = chooseMethod(data, n); break
+    case 'ask_mpesa_phone':     result = await doMpesa(data, raw, phone); break
+    case 'card_number':         result = cardNumber(data, raw); break
+    case 'card_expiry':         result = cardExpiry(data, raw); break
+    case 'card_cvv':            result = await cardCvv(data, raw, phone); break
+    case 'ask_results_adm':     result = await handleResultsAdmission(data, raw); break
+    case 'pick_results_period': result = await handleResultsPeriod(data, n || raw); break
+    case 'ask_statement_adm':   result = await handleStatementAdm(data, raw); break
+    case 'pick_stmt_month':     result = await handleStatementMonth(data, n, raw); break
+    default:                    result = mainMenu(data)
   }
 
-  // Push current step to history when advancing forward (not on errors or resets to welcome)
-  if (result.nextStep !== step && result.nextStep !== 'welcome' && step !== 'welcome') {
-    const cleanData = { ...data }
-    delete cleanData._hist
-    const newHist = [...hist, { step, data: cleanData }].slice(-6)
+  // ── History tracking ─────────────────────────────────────────
+  const menuSteps = ['main_menu', 'welcome']
+  if (result.nextStep !== step && !menuSteps.includes(result.nextStep) && !menuSteps.includes(step)) {
+    const cleanData = { ...data }; delete cleanData._hist
+    const newHist = [...hist, { step, data: cleanData }].slice(-7)
     result.sessionData = { ...result.sessionData, _hist: newHist }
-  } else if (result.nextStep !== 'welcome') {
-    // Stayed on same step (validation error) — carry history forward
+  } else if (!menuSteps.includes(result.nextStep)) {
     result.sessionData = { ...result.sessionData, _hist: hist }
   }
 
   return result
 }
 
+// Handles 1/2/3/4 from the main menu
+async function handleMainMenuChoice(data, n, raw, phone) {
+  switch (n) {
+    case '1': return {
+      text: `💳 *Pay Fees*\n━━━━━━━━━━━━━━━━━━━━\n\nPlease enter your *email address*.\nWe will send your payment receipt here.\n\n  📧 _(e.g. parent@gmail.com)_\n\n_*0* back · *6* menu_`,
+      nextStep: 'ask_email', sessionData: {}
+    }
+    case '2': {
+      // If student already in session, show balance directly
+      if (data.student_id) return await showBalance(data, phone)
+      return {
+        text: `📊 *Check Fee Balance*\n━━━━━━━━━━━━━━━━━━━━\n\nEnter the student's *Admission Number*:\n\n  🎓 _(e.g. ADM/2025/001)_\n\n_*0* back · *6* menu_`,
+        nextStep: 'ask_admission', sessionData: { ...data, _balance_only: true }
+      }
+    }
+    case '3': return await showResults(data, phone)
+    case '4': return await showStatements(data, phone)
+    default:
+      return {
+        text: `Please type a number to select:\n\n  *1* · 2 · 3 · 4\n\n_*6* for main menu_`,
+        nextStep: 'main_menu', sessionData: data
+      }
+  }
+}
+
 // Re-renders the prompt for a step when user goes back
 function getStepPrompt(step, data) {
   switch (step) {
-    case 'welcome': return welcome()
+    case 'main_menu': return mainMenu(data)
 
     case 'ask_email': return {
       text: `📧 *Enter Your Email Address*\n\nPlease provide your email so we can send your payment receipt.\n\n  _(e.g. parent@gmail.com)_\n\n_*6* for main menu_`,
@@ -562,7 +659,7 @@ function getStepPrompt(step, data) {
 
     case 'show_fees': {
       const fees = data.fees || []
-      if (!fees.length) return welcome()
+      if (!fees.length) return mainMenu(data)
       const total = fees.reduce((s, f) => s + Number(f.balance), 0)
       let msg = `📋 *Outstanding Fees*\n━━━━━━━━━━━━━━━━━━━━\n\n👤 *${data.student_name}*\n\n`
       fees.forEach((f, i) => {
@@ -595,7 +692,7 @@ function getStepPrompt(step, data) {
       nextStep: 'card_expiry', sessionData: data
     }
 
-    default: return welcome()
+    default: return mainMenu(data)
   }
 }
 
@@ -669,7 +766,7 @@ async function buildPeriodPicker(studentId, data) {
     if (!available || available.length === 0) {
       return {
         text: `📊 *Academic Results*\n━━━━━━━━━━━━━━━━━━━━\n\n  👤 *${data.results_student_name || 'Student'}*\n\nNo results have been recorded yet.\nResults are uploaded by teachers after each examination.\n\n_Type *balance* for fees · *hi* for menu_`,
-        nextStep: 'welcome',
+        nextStep: 'main_menu',
         sessionData: { student_id: studentId }
       }
     }
@@ -702,7 +799,7 @@ async function buildPeriodPicker(studentId, data) {
     }
   } catch (err) {
     console.error('buildPeriodPicker error:', err.message)
-    return { text: `❌ Could not load results. Type *results* to retry.`, nextStep: 'welcome', sessionData: {} }
+    return { text: `❌ Could not load results. Type *results* to retry.`, nextStep: 'main_menu', sessionData: {} }
   }
 }
 
@@ -759,7 +856,7 @@ async function fetchResults(studentId, filterYear = null, filterTerm = null, ses
     if (!results || results.length === 0) {
       return {
         text: `📊 *Academic Results — ${periodLabel}*\n━━━━━━━━━━━━━━━━━━━━\n\n  👤 *${name}*${cls ? `\n  🏫 ${cls}` : ''}\n\n━━━━━━━━━━━━━━━━━━━━\nNo results found for *${periodLabel}*.\n\n_Type *results* to pick a different period · *hi* for menu_`,
-        nextStep: 'welcome',
+        nextStep: 'main_menu',
         sessionData: { student_id: studentId }
       }
     }
@@ -821,16 +918,197 @@ async function fetchResults(studentId, filterYear = null, filterTerm = null, ses
 
     return {
       text: msg,
-      nextStep: 'welcome',
+      nextStep: 'main_menu',
       sessionData: { student_id: studentId }
     }
   } catch (err) {
     console.error('fetchResults error:', err.message)
     return {
       text: `❌ Could not load results. Type *results* to retry or *hi* for menu.`,
-      nextStep: 'welcome',
+      nextStep: 'main_menu',
       sessionData: {}
     }
+  }
+}
+
+// ============================================================
+// STATEMENTS
+// ============================================================
+async function showStatements(data, phone) {
+  const studentId = data.student_id
+  if (!studentId) {
+    return {
+      text: `📄 *Payment Statements*\n━━━━━━━━━━━━━━━━━━━━\n\nEnter the student's *Admission Number* to view their payment history:\n\n  🎓 _(e.g. ADM/2025/001)_\n\n_*0* back · *6* menu_`,
+      nextStep: 'ask_statement_adm', sessionData: data
+    }
+  }
+  return await buildStatementMonthPicker(studentId, data)
+}
+
+async function handleStatementAdm(data, body) {
+  let student = null
+  try {
+    const { data: s } = await supabase.from('students')
+      .select('*, classes(name, stream)')
+      .eq('school_id', SCHOOL_ID).ilike('admission_number', body.trim()).eq('is_active', true).single()
+    student = s
+  } catch (e) {}
+
+  if (!student) {
+    return {
+      text: `❌ *Student Not Found*\n\n"${body.trim()}" does not match any record.\nPlease check and try again.\n\n  🎓 _(e.g. ADM/2025/001)_\n\n_*0* back · *6* menu_`,
+      nextStep: 'ask_statement_adm', sessionData: data
+    }
+  }
+
+  const cls = student.classes
+    ? `${student.classes.name}${student.classes.stream ? ' ' + student.classes.stream : ''}`
+    : ''
+  return await buildStatementMonthPicker(student.id, {
+    ...data,
+    student_id: student.id,
+    student_name: `${student.first_name} ${student.last_name}`,
+    student_class: cls
+  })
+}
+
+async function buildStatementMonthPicker(studentId, data) {
+  try {
+    const { data: payments } = await supabase.from('payments')
+      .select('created_at, amount, payment_method, paystack_reference, status')
+      .eq('student_id', studentId)
+      .eq('status', 'success')
+      .order('created_at', { ascending: false })
+
+    if (!payments || payments.length === 0) {
+      return {
+        text: `📄 *Payment Statements*\n━━━━━━━━━━━━━━━━━━━━\n\n  👤 *${data.student_name}*\n\nNo payment records found for this student yet.\n\n_Type *1* to pay fees · *6* menu_`,
+        nextStep: 'main_menu', sessionData: data
+      }
+    }
+
+    // Build unique month list
+    const seen = new Set(), months = []
+    payments.forEach(p => {
+      const d = new Date(p.created_at)
+      const key = `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}`
+      const label = d.toLocaleDateString('en-GB', { month: 'long', year: 'numeric' })
+      if (!seen.has(key)) { seen.add(key); months.push({ key, label }) }
+    })
+
+    const name = data.student_name || 'Student'
+    let msg = `📄 *Payment Statements*\n━━━━━━━━━━━━━━━━━━━━\n\n`
+    msg += `  👤 *${name}*\n`
+    if (data.student_class) msg += `  🏫 ${data.student_class}\n`
+    msg += `\nSelect a period to view:\n\n`
+    months.forEach((m, i) => { msg += `  *${i+1}.* ${m.label}\n` })
+    msg += `  *${months.length+1}.* All transactions\n`
+    msg += `\n━━━━━━━━━━━━━━━━━━━━\n_Type a number · *0* back · *6* menu_`
+
+    return {
+      text: msg,
+      nextStep: 'pick_stmt_month',
+      sessionData: { ...data, stmt_student_id: studentId, stmt_months: months }
+    }
+  } catch (err) {
+    console.error('buildStatementMonthPicker error:', err.message)
+    return { text: `❌ Could not load statements. Type *statements* to retry.`, nextStep: 'main_menu', sessionData: data }
+  }
+}
+
+async function handleStatementMonth(data, n, raw) {
+  const months    = data.stmt_months    || []
+  const studentId = data.stmt_student_id || data.student_id
+  const allChoice = months.length + 1
+
+  let filterKey = null
+  if (n === 'all' || parseInt(n) === allChoice) {
+    filterKey = null  // all months
+  } else {
+    const idx = parseInt(n) - 1
+    if (isNaN(idx) || idx < 0 || idx >= months.length) {
+      return {
+        text: `❌ Please type *1 to ${allChoice}* to select a period.\n\n_*0* back · *6* menu_`,
+        nextStep: 'pick_stmt_month', sessionData: data
+      }
+    }
+    filterKey = months[idx].key
+    data._stmt_label = months[idx].label
+  }
+
+  return await fetchStatement(studentId, filterKey, data)
+}
+
+async function fetchStatement(studentId, filterKey, data) {
+  try {
+    let query = supabase.from('payments')
+      .select('amount, payment_method, paystack_reference, paid_by_email, created_at')
+      .eq('student_id', studentId)
+      .eq('status', 'success')
+      .order('created_at', { ascending: false })
+
+    const { data: payments } = await query
+    if (!payments || !payments.length) {
+      return {
+        text: `📄 No payments found for this period.\n\n_Type *0* back · *6* menu_`,
+        nextStep: 'main_menu', sessionData: data
+      }
+    }
+
+    // Filter by month key if set
+    const filtered = filterKey
+      ? payments.filter(p => {
+          const d = new Date(p.created_at)
+          const key = `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}`
+          return key === filterKey
+        })
+      : payments
+
+    if (!filtered.length) {
+      return {
+        text: `📄 No payments found for that period.\n\n_Type *0* back · *6* menu_`,
+        nextStep: 'pick_stmt_month', sessionData: data
+      }
+    }
+
+    const periodLabel = filterKey ? (data._stmt_label || filterKey) : 'All Time'
+    const totalPaid   = filtered.reduce((s, p) => s + Number(p.amount), 0)
+    const methodLabels = { mpesa: 'M-Pesa', card: 'Card', bank: 'Bank Transfer' }
+
+    let msg = `📄 *Statement — ${periodLabel}*\n━━━━━━━━━━━━━━━━━━━━\n\n`
+    msg += `  👤 *${data.student_name || 'Student'}*\n\n`
+    msg += `━━━━━━━━━━━━━━━━━━━━\n`
+
+    // Group by month for "All time" view
+    const byMonth = {}
+    filtered.forEach(p => {
+      const d   = new Date(p.created_at)
+      const mon = d.toLocaleDateString('en-GB', { month: 'long', year: 'numeric' })
+      if (!byMonth[mon]) byMonth[mon] = []
+      byMonth[mon].push(p)
+    })
+
+    Object.entries(byMonth).forEach(([month, txns]) => {
+      if (!filterKey) msg += `\n📅 *${month}*\n`
+      txns.forEach(p => {
+        const d      = new Date(p.created_at)
+        const date   = d.toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })
+        const method = methodLabels[p.payment_method] || p.payment_method
+        msg += `\n  ✅ *KES ${Number(p.amount).toLocaleString()}*\n`
+        msg += `     ${method} · ${date}\n`
+        msg += `     Ref: \`${p.paystack_reference}\`\n`
+      })
+    })
+
+    msg += `\n━━━━━━━━━━━━━━━━━━━━\n`
+    msg += `💰 *Total Paid: KES ${totalPaid.toLocaleString()}*\n`
+    msg += `━━━━━━━━━━━━━━━━━━━━\n\n`
+    msg += `_Type *0* for another period · *6* menu_`
+
+    return { text: msg, nextStep: 'main_menu', sessionData: data }
+  } catch (err) {
+    console.error('fetchStatement error:', err.message)
+    return { text: `❌ Could not load statement. Type *statements* to retry.`, nextStep: 'main_menu', sessionData: data }
   }
 }
 
@@ -879,19 +1157,26 @@ async function showBalance(data, phone) {
       msg += `\n━━━━━━━━━━━━━━━━━━━━\n\n`
       msg += `_Type *hi* to pay now · *balance* to refresh_`
     }
-    return { text: msg, nextStep: 'welcome', sessionData: { student_id: studentId } }
+    return { text: msg, nextStep: 'main_menu', sessionData: { student_id: studentId } }
   } catch (err) {
     console.error('showBalance error:', err.message)
-    return { text: `❌ Could not load balance. Type *balance* to retry or *hi* to pay.`, nextStep: 'welcome', sessionData: {} }
+    return { text: `❌ Could not load balance. Type *balance* to retry or *hi* to pay.`, nextStep: 'main_menu', sessionData: {} }
   }
 }
 
-function welcome() {
+function mainMenu(data = {}) {
+  const name = data.student_name || data.results_student_name || null
+  const greeting = name
+    ? `Welcome back! 👋\n\n  👤 *${name}*\n\nWhat would you like to do?`
+    : `Hello! 👋 Welcome to SchoolPay.\n\nPay and manage school fees securely.`
   return {
-    text: `🏫 *SchoolPay — School Fee Payment*\n━━━━━━━━━━━━━━━━━━━━\n\nHello! 👋 Welcome to SchoolPay.\n\nTo get started, please enter your *email address*.\nThis is where we will send your payment receipt.\n\n  📧 _(e.g. parent@gmail.com)_\n\n━━━━━━━━━━━━━━━━━━━━\n_Quick commands: *balance* · *results* · *0* back · *6* menu_`,
-    nextStep: 'ask_email', sessionData: {}
+    text: `🏫 *SchoolPay* — School Fee Portal\n━━━━━━━━━━━━━━━━━━━━\n\n${greeting}\n\n  *1.* 💳  Pay Fees\n  *2.* 📊  Check Fee Balance\n  *3.* 📚  Academic Results\n  *4.* 📄  Payment Statements\n\n━━━━━━━━━━━━━━━━━━━━\n_Type a number to select_`,
+    nextStep: 'main_menu', sessionData: data
   }
 }
+
+// Keep welcome as alias so existing calls work
+function welcome(data = {}) { return mainMenu(data) }
 
 function askEmail(data, body) {
   const email = body.trim().toLowerCase()
@@ -929,7 +1214,7 @@ async function askAdmission(data, body) {
   if (!outstanding.length) {
     return {
       text: `✅ *All Fees Cleared!*\n━━━━━━━━━━━━━━━━━━━━\n\n  👤 *${student.first_name} ${student.last_name}*\n  🏫 ${cls}\n\nThis student has no outstanding fees.\nThank you for keeping up with payments! 🎉\n\n_Type *balance* to check · *hi* to start again_`,
-      nextStep: 'welcome', sessionData: {}
+      nextStep: 'main_menu', sessionData: {}
     }
   }
 
@@ -963,7 +1248,7 @@ async function askAdmission(data, body) {
 
 function showFees(data, body) {
   const fees = data.fees || []
-  if (!fees.length) return welcome()
+  if (!fees.length) return mainMenu(data)
 
   const input = body.trim().toUpperCase()
   let selected = [], total = 0, label = ''
@@ -1032,7 +1317,7 @@ function chooseMethod(data, body) {
     savePending(data, ref, 'bank').catch(console.error)
     return {
       text: `🏦 *Bank Transfer Details*\n━━━━━━━━━━━━━━━━━━━━\n\n  👤 ${data.student_name}\n  📋 ${data.fee_label}\n  💰 *KES ${Number(data.total_amount).toLocaleString()}*\n\n━━━━━━━━━━━━━━━━━━━━\n  🏦 Bank:    *Equity Bank*\n  📝 Account: *0123456789*\n  🏷️  Name:    *Sunshine Academy*\n  🔑 Ref:     *${ref}*\n━━━━━━━━━━━━━━━━━━━━\n\nUse *${ref}* as your payment reference when making the transfer.\n\n_Type *hi* to return to the main menu_`,
-      nextStep: 'welcome', sessionData: {}
+      nextStep: 'main_menu', sessionData: {}
     }
   }
 }
@@ -1079,12 +1364,12 @@ async function doMpesa(data, body, phone) {
         data.student_id, data.total_amount, data.fee_label,
         ref, data.email, data.guardian_name, data.student_name
       )
-      return { text: successMsg, nextStep: 'welcome', sessionData: {} }
+      return { text: successMsg, nextStep: 'main_menu', sessionData: {} }
     }
 
     return {
       text: `📱 *M-Pesa — Payment Prompt Sent!*\n━━━━━━━━━━━━━━━━━━━━\n\n✅ A payment request has been sent to:\n   📲 *${paystackPhone}*\n\nPlease *enter your M-Pesa PIN* when the prompt appears on your phone.\n\n  💰 Amount: *KES ${Number(data.total_amount).toLocaleString()}*\n  📋 ${data.fee_label}\n  🔑 Ref: \`${ref}\`\n${displayText ? `\n  _${displayText}_\n` : ''}\n━━━━━━━━━━━━━━━━━━━━\n⏳ You have *60 seconds* to complete this.\n\n_Once confirmed, you will automatically receive a receipt with your remaining balance here._`,
-      nextStep: 'welcome', sessionData: { waiting_ref: ref, guardian_phone: phone }
+      nextStep: 'main_menu', sessionData: { waiting_ref: ref, guardian_phone: phone }
     }
   } catch (err) {
     const msg = err.response?.data?.message || err.message || 'Unknown error'
@@ -1156,12 +1441,12 @@ async function cardCvv(data, body, phone) {
         data.student_id, data.total_amount, data.fee_label,
         ref, data.email, data.guardian_name, data.student_name
       )
-      return { text: successMsg, nextStep: 'welcome', sessionData: {} }
+      return { text: successMsg, nextStep: 'main_menu', sessionData: {} }
     }
 
     return {
       text: `⏳ *Payment Being Processed*\n━━━━━━━━━━━━━━━━━━━━\n\n  🔑 Reference: \`${ref}\`\n\nYour payment is being verified. Please wait a moment.\n\nYou will automatically receive a confirmation receipt here once it is approved.\n\n_Type *6* for main menu_`,
-      nextStep: 'welcome', sessionData: {}
+      nextStep: 'main_menu', sessionData: {}
     }
   } catch (err) {
     const msg = err.response?.data?.message || 'Card declined'
@@ -1345,7 +1630,7 @@ async function getSession(phone) {
         .insert({ phone_number: phone, current_step: 'welcome', session_data: {} }).select().single()
       return s || { phone_number: phone, current_step: 'welcome', session_data: {} }
     }
-    if (data.last_activity && (Date.now() - new Date(data.last_activity)) > 30 * 60 * 1000) {
+    if (data.last_activity && (Date.now() - new Date(data.last_activity)) > 24 * 60 * 60 * 1000) {
       await supabase.from('whatsapp_sessions').update({ current_step: 'welcome', session_data: {}, last_activity: new Date() }).eq('phone_number', phone)
       return { ...data, current_step: 'welcome', session_data: {} }
     }
