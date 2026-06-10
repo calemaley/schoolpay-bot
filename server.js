@@ -57,6 +57,480 @@ function generateRef() {
   return `SCH-${Date.now()}-${Math.random().toString(36).substr(2, 5).toUpperCase()}`
 }
 
+// ============================================================
+// INSTALLMENT PLAN — 40% / 40% / 20% across the 3-month term
+// ============================================================
+// Cumulative payment targets as a share of amount_due:
+// after installment 1 → 40%, after 2 → 80%, after 3 → 100%.
+const INSTALLMENT_TARGETS = [0.4, 0.8, 1.0]
+const INSTALLMENT_PCTS    = ['40%', '40%', '20%']
+
+// Works out which installment is next for a fee and how much it is.
+// Self-correcting: amounts are derived from what has actually been paid,
+// so odd partial payments still land on the right cumulative target.
+function nextInstallment(fee) {
+  const balance = Number(fee.balance)
+  const due     = Number(fee.amount_due || balance)
+  const paid    = fee.amount_paid != null ? Number(fee.amount_paid) : due - balance
+  for (let i = 0; i < INSTALLMENT_TARGETS.length; i++) {
+    const target = Math.round(due * INSTALLMENT_TARGETS[i])
+    if (paid < target) {
+      return { number: i + 1, amount: Math.min(target - paid, balance) }
+    }
+  }
+  return null
+}
+
+// Builds the per-fee installment amounts for a selection of fees.
+// Returns fees tagged with pay_amount + the overall installment number/total.
+function buildInstallmentSelection(fees) {
+  let total = 0, number = 1
+  const selected = fees.map(f => {
+    const ni = nextInstallment(f) || { number: 3, amount: Number(f.balance) }
+    number = Math.max(number, ni.number)
+    total += ni.amount
+    return { ...f, pay_amount: ni.amount, installment_no: ni.number }
+  })
+  return { selected, total, number }
+}
+
+// Human-readable 3-row schedule, marking past/current/future installments
+function installmentScheduleText(fees, currentNo) {
+  const due = fees.reduce((s, f) => s + Number(f.amount_due || f.balance), 0)
+  const monthNames = []
+  for (let i = 0; i < 3; i++) {
+    const d = new Date()
+    d.setMonth(d.getMonth() + (i - (currentNo - 1)))
+    monthNames.push(d.toLocaleDateString('en-GB', { month: 'long' }))
+  }
+  let txt = ''
+  for (let i = 0; i < 3; i++) {
+    const share = Math.round(due * (INSTALLMENT_TARGETS[i] - (i > 0 ? INSTALLMENT_TARGETS[i - 1] : 0)))
+    const status = i + 1 < currentNo ? '✅' : i + 1 === currentNo ? '👉' : '🗓️'
+    const when   = i + 1 < currentNo ? 'paid' : i + 1 === currentNo ? `due now (${monthNames[i]})` : monthNames[i]
+    txt += `  ${status} *${INSTALLMENT_PCTS[i]}* — KES ${share.toLocaleString()} — _${when}_\n`
+  }
+  return txt
+}
+
+// ============================================================
+// LANGUAGE + FLOW HELPERS — Figma flows 2014-167 (EN) / 2014-164 (SW)
+// ============================================================
+const MONTHS_EN = ['January','February','March','April','May','June','July','August','September','October','November','December']
+const MONTHS_SW = ['Januari','Februari','Machi','Aprili','Mei','Juni','Julai','Agosti','Septemba','Oktoba','Novemba','Desemba']
+const TERMS_SW  = { 1: 'Muhula wa kwanza', 2: 'Muhula wa pili', 3: 'Muhula wa tatu' }
+
+function langOf(data)      { return data && data.lang === 'sw' ? 'sw' : 'en' }
+function monthName(d, lang){ return (lang === 'sw' ? MONTHS_SW : MONTHS_EN)[d.getMonth()] }
+
+// Kenyan school calendar: Jan–Apr = Term 1, May–Aug = Term 2, Sep–Dec = Term 3
+function currentTermNo(d = new Date()) {
+  const m = d.getMonth()
+  return m <= 3 ? 1 : m <= 7 ? 2 : 3
+}
+function termLabel(lang, d = new Date()) {
+  const t = currentTermNo(d)
+  return lang === 'sw' ? TERMS_SW[t] : `Term ${t}`
+}
+
+const BACK = { en: '* Back', sw: '* Rudi' }
+const HOME = { en: '* Home', sw: '* Rudi mwanzo' }
+const SCHOOL_LABEL = () => process.env.SCHOOL_NAME || 'School XYZ'
+
+// Children linked to the texting/dialling guardian phone (last 9 digits)
+async function findChildrenByPhone(phone) {
+  const digits = phone.replace(/\D/g, '').slice(-9)
+  if (digits.length < 9) return []
+  try {
+    const { data } = await supabase.from('students')
+      .select('*, classes(name, stream)')
+      .eq('school_id', SCHOOL_ID).eq('is_active', true)
+      .or(`guardian1_phone.ilike.%${digits},guardian1_whatsapp.ilike.%${digits}`)
+      .order('first_name')
+    return data || []
+  } catch (e) { console.error('findChildrenByPhone:', e.message); return [] }
+}
+
+// Spread a custom payment amount across outstanding fees, oldest category first
+function allocateAmount(fees, amount) {
+  let rem = Math.round(Number(amount))
+  const out = []
+  for (const f of fees) {
+    if (rem <= 0) break
+    const take = Math.min(Number(f.balance), rem)
+    rem -= take
+    out.push({ ...f, pay_amount: take })
+  }
+  return out
+}
+
+// "3000", "3,000", "Ksh 3,000" → 3000
+function parseAmount(raw) {
+  const m = raw.replace(/,/g, '').match(/(\d+(?:\.\d+)?)/)
+  return m ? Math.round(parseFloat(m[1])) : null
+}
+
+// Month (or term, when results carry no timestamp) periods for the results picker
+function periodInfo(r) {
+  if (r.created_at) {
+    const d = new Date(r.created_at)
+    return {
+      key:   `m:${d.getFullYear()}-${d.getMonth()}`,
+      en:    MONTHS_EN[d.getMonth()],
+      sw:    MONTHS_SW[d.getMonth()],
+      label: `${MONTHS_EN[d.getMonth()]}/${d.getFullYear()}`,
+      sort:  d.getFullYear() * 100 + d.getMonth()
+    }
+  }
+  return {
+    key:   `t:${r.year}-${r.term}`,
+    en:    `Term ${r.term} ${r.year}`,
+    sw:    `Muhula ${r.term} ${r.year}`,
+    label: `Term ${r.term}/${r.year}`,
+    sort:  (Number(r.year) || 0) * 100 + (Number(r.term) || 0)
+  }
+}
+
+// Help requests go to a table (if present) and the school email — best effort
+async function logHelpRequest(phone, issue) {
+  console.log(`[HELP] ${phone}: ${issue}`)
+  try {
+    await supabase.from('help_requests').insert({ school_id: SCHOOL_ID, phone, issue, status: 'open' })
+  } catch (e) { console.error('logHelpRequest insert:', e.message) }
+  if (process.env.EMAIL_USER && process.env.EMAIL_PASS) {
+    try {
+      await emailTransporter.sendMail({
+        from:    `"${process.env.SCHOOL_NAME || 'SchoolPay'}" <${process.env.EMAIL_USER}>`,
+        to:      process.env.DEFAULT_RECEIPT_EMAIL || process.env.EMAIL_USER,
+        subject: `SchoolPay help request from ${phone}`,
+        text:    `Guardian ${phone} reported via the bot:\n\n${issue}\n\nPlease follow up.`
+      })
+    } catch (e) { console.error('logHelpRequest email:', e.message) }
+  }
+}
+
+// ============================================================
+// WHATSAPP / SMS SCREENS (per Figma)
+// ============================================================
+function mainMenu(data = {}) {
+  const lang = langOf(data)
+  const items = lang === 'sw'
+    ? `1. Lipa karo\n2. Karo idaiwayo\n3. Matokeo ya elimu\n4. Back to english`
+    : `1. Pay Fees\n2. Check fee balance\n3. Academic results\n4. Badili lugha`
+  return { text: `SchoolPay\n\n${items}`, nextStep: 'main_menu', sessionData: { lang: data.lang } }
+}
+
+function invalidReply(data, step) {
+  const lang = langOf(data)
+  const txt = lang === 'sw' ? 'Chaguo si sahihi. Jaribu tena.' : 'Invalid choice. Please try again.'
+  return { text: `SchoolPay\n\n${txt}\n\n${BACK[lang]}`, nextStep: step, sessionData: data }
+}
+
+// Entry to every flow: list the guardian's children (Figma child-select card)
+async function startFlow(data, phone, purpose) {
+  const lang = langOf(data)
+  const children = await findChildrenByPhone(phone)
+  if (!children.length) return helpMissingMenu({ lang: data.lang })
+  let msg = `SchoolPay\n\n`
+  children.forEach((c, i) => { msg += `${i + 1}. ${c.first_name} ${c.last_name} - ${SCHOOL_LABEL()}\n` })
+  msg += `${children.length + 1}. ${lang === 'sw' ? 'Msaada' : 'Help'}\n\n${BACK[lang]}`
+  return {
+    text: msg, nextStep: 'pick_child',
+    sessionData: {
+      lang: data.lang, _purpose: purpose,
+      _children: children.map(c => ({
+        id: c.id,
+        name: `${c.first_name} ${c.last_name}`,
+        guardian_name: c.guardian1_name || 'Guardian'
+      }))
+    }
+  }
+}
+
+async function handleChildPick(data, n, phone) {
+  const kids = data._children || []
+  const num = parseInt(n)
+  if (num === kids.length + 1) return helpListedMenu(data)
+  if (isNaN(num) || num < 1 || num > kids.length) return invalidReply(data, 'pick_child')
+  const kid = kids[num - 1]
+  const base = { ...data, student_id: kid.id, student_name: kid.name, guardian_name: kid.guardian_name }
+  if (data._purpose === 'balance') return await balanceScreen(base)
+  if (data._purpose === 'results') return await resultsMonthMenu(base)
+  return await paymentProgressMenu(base)
+}
+
+// ── Fee payment ───────────────────────────────────────────────
+async function paymentProgressMenu(data) {
+  const lang = langOf(data)
+  const { data: allFees } = await supabase.from('v_student_fee_summary')
+    .select('*').eq('student_id', data.student_id).order('fee_category')
+  const outstanding = (allFees || []).filter(f => Number(f.balance) > 0)
+  if (!outstanding.length) {
+    const txt = lang === 'sw'
+      ? `${data.student_name} hana salio la karo. Karo yote imelipwa.`
+      : `${data.student_name} has no outstanding fees. All fees are cleared.`
+    return { text: `SchoolPay\n\n${txt}\n\n${HOME[lang]}`, nextStep: 'main_menu', sessionData: { lang: data.lang } }
+  }
+  const term = termLabel(lang)
+  const opts = lang === 'sw'
+    ? `1. Lipa pole pole\n2. Lipa salio lote la ${term.toLowerCase()}`
+    : `1. Lipa pole pole\n2. Pay all ${term} fees`
+  return {
+    text: `SchoolPay\n\nPayment progress\n\n${opts}\n\n${BACK[lang]}`,
+    nextStep: 'payment_progress',
+    sessionData: { ...data, fees: outstanding }
+  }
+}
+
+async function handleProgressChoice(data, n) {
+  if (n === '1') return amountScreen({ ...data, plan: 'pole' })
+  if (n === '2') return amountScreen({ ...data, plan: 'full' })
+  return invalidReply(data, 'payment_progress')
+}
+
+function amountScreen(data) {
+  const lang = langOf(data)
+  const fees = data.fees || []
+  let label, amount
+  if (data.plan === 'pole') {
+    amount = buildInstallmentSelection(fees).total
+    const mon = monthName(new Date(), lang)
+    label = lang === 'sw'
+      ? `Salio la ${mon} Ksh ${amount.toLocaleString()}`
+      : `${mon} balance Ksh ${amount.toLocaleString()}`
+  } else {
+    amount = fees.reduce((s, f) => s + Number(f.balance), 0)
+    const term = termLabel(lang)
+    label = lang === 'sw'
+      ? `Salio la ${term.toLowerCase()} Ksh ${amount.toLocaleString()}`
+      : `${term} full balance Ksh ${amount.toLocaleString()}`
+  }
+  const body = lang === 'sw'
+    ? `1. Lipa pesa yote\n\nau andika malipo, kwa mfano, 3,000`
+    : `1. Pay full balance\n\nor reply with amount, e.g Ksh 3,000`
+  return {
+    text: `SchoolPay\n\n${label}\n\n${body}\n\n${BACK[lang]}`,
+    nextStep: 'ask_amount',
+    sessionData: { ...data, _shown_amount: amount }
+  }
+}
+
+function mpesaPrompt(data) {
+  const lang = langOf(data)
+  const txt = lang === 'sw'
+    ? 'Andika nambari ya M-Pesa kwa ajili ya malipo'
+    : 'Enter M-Pesa number for payment'
+  return { text: `SchoolPay\n\n${txt}\n\n${BACK[lang]}`, nextStep: 'ask_mpesa_phone', sessionData: data }
+}
+
+async function handleAmount(data, n, raw) {
+  const lang = langOf(data)
+  const fees = data.fees || []
+  const termTotal = fees.reduce((s, f) => s + Number(f.balance), 0)
+  const amount = n === '1' ? Number(data._shown_amount) : parseAmount(raw)
+  if (!amount || amount <= 0 || amount > termTotal) {
+    const txt = lang === 'sw'
+      ? `Kiasi si sahihi. Andika kiasi kati ya 1 na ${termTotal.toLocaleString()}, au 1 kulipa pesa yote.`
+      : `Invalid amount. Reply with an amount between 1 and ${termTotal.toLocaleString()}, or 1 to pay the full balance.`
+    return { text: `SchoolPay\n\n${txt}\n\n${BACK[lang]}`, nextStep: 'ask_amount', sessionData: data }
+  }
+  const selected = allocateAmount(fees, amount)
+  const feeLabel = `${termLabel('en')} fees${data.plan === 'pole' ? ' — Lipa pole pole' : ''}`
+  return mpesaPrompt({ ...data, selected_fees: selected, total_amount: amount, fee_label: feeLabel })
+}
+
+// ── Check balance ─────────────────────────────────────────────
+async function balanceScreen(data) {
+  const lang = langOf(data)
+  const { data: allFees } = await supabase.from('v_student_fee_summary')
+    .select('*').eq('student_id', data.student_id).order('fee_category')
+  const outstanding = (allFees || []).filter(f => Number(f.balance) > 0)
+  const termTotal = outstanding.reduce((s, f) => s + Number(f.balance), 0)
+  const monthDue  = buildInstallmentSelection(outstanding).total
+  const mon  = monthName(new Date(), lang)
+  const term = termLabel(lang)
+  const lines = !outstanding.length
+    ? (lang === 'sw' ? 'Karo yote imelipwa. Hakuna salio.' : 'All fees are cleared. No balance due.')
+    : (lang === 'sw'
+        ? `Salio la ${mon} ni Ksh ${monthDue.toLocaleString()}\nSalio la ${term} ni Ksh ${termTotal.toLocaleString()}`
+        : `${mon} balance Ksh ${monthDue.toLocaleString()}\n${term} full balance Ksh ${termTotal.toLocaleString()}`)
+  const opt = lang === 'sw' ? '1. Risiti ya malipo' : '1. Payment Statement'
+  return {
+    text: `SchoolPay\n\n${lines}\n\n${opt}\n\n${BACK[lang]}`,
+    nextStep: 'balance_menu',
+    sessionData: data
+  }
+}
+
+async function handleBalanceMenu(data, n, phone, channel) {
+  if (n === '1') return await shareStatement(data, phone, channel)
+  return invalidReply(data, 'balance_menu')
+}
+
+async function shareStatement(data, phone, channel) {
+  const lang = langOf(data)
+  const { data: payments } = await supabase.from('payments')
+    .select('amount, payment_method, paystack_reference, created_at')
+    .eq('student_id', data.student_id).eq('status', 'success')
+    .order('created_at', { ascending: false })
+
+  let body = ''
+  if (!payments || !payments.length) {
+    body = lang === 'sw' ? 'Hakuna malipo yaliyorekodiwa bado.' : 'No payments recorded yet.'
+  } else {
+    payments.slice(0, 10).forEach(p => {
+      const d = new Date(p.created_at).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })
+      body += `${d}  Ksh ${Number(p.amount).toLocaleString()}  ${p.payment_method}\n`
+    })
+    const total = payments.reduce((s, p) => s + Number(p.amount), 0)
+    body += lang === 'sw' ? `\nJumla iliyolipwa: Ksh ${total.toLocaleString()}` : `\nTotal paid: Ksh ${total.toLocaleString()}`
+  }
+
+  // WhatsApp users also get the official PDF in the background
+  if (channel === 'wa' && payments && payments.length) {
+    generateStatementPDF(data.student_id, null, 'All Time', data.student_name || 'Student', '')
+      .then(pdf => dispatchPDF(
+        pdf, `statement_${(data.student_name || 'student').replace(/\s+/g, '_')}_${Date.now()}.pdf`,
+        process.env.DEFAULT_RECEIPT_EMAIL || null, phone,
+        `Payment Statement — ${data.student_name}`,
+        `Please find attached the payment statement for ${data.student_name}.`
+      ))
+      .catch(e => console.error('shareStatement pdf:', e.message))
+  }
+
+  const shared = lang === 'sw' ? 'Risiti ya malipo imetumwa' : 'Payment Statement shared'
+  return {
+    text: `SchoolPay\n\n${shared}\n\n${data.student_name}\n${body}\n\n${HOME[lang]}`,
+    nextStep: 'main_menu',
+    sessionData: { lang: data.lang }
+  }
+}
+
+// ── Academic results ──────────────────────────────────────────
+async function resultsMonthMenu(data) {
+  const lang = langOf(data)
+  const { data: results } = await supabase.from('student_results')
+    .select('*').eq('student_id', data.student_id)
+  if (!results || !results.length) {
+    const txt = lang === 'sw'
+      ? `Hakuna matokeo ya ${data.student_name} bado.`
+      : `No results recorded for ${data.student_name} yet.`
+    return { text: `SchoolPay\n\n${txt}\n\n${HOME[lang]}`, nextStep: 'main_menu', sessionData: { lang: data.lang } }
+  }
+  const seen = new Set()
+  let periods = []
+  results.forEach(r => {
+    const pi = periodInfo(r)
+    if (!seen.has(pi.key)) { seen.add(pi.key); periods.push(pi) }
+  })
+  periods.sort((a, b) => b.sort - a.sort)
+  periods = periods.slice(0, 5)
+  const ready = lang === 'sw' ? `Matokeo ya ${periods[0].sw} tayari` : `${periods[0].en} results ready`
+  let msg = `SchoolPay\n\n${ready}\n\n`
+  periods.forEach((p, i) => { msg += `${i + 1}. ${p.label}\n` })
+  msg += `${periods.length + 1}. All\n\n${BACK[lang]}`
+  return {
+    text: msg, nextStep: 'pick_results_month',
+    sessionData: { ...data, _periods: periods.map(p => ({ key: p.key, en: p.en, sw: p.sw, label: p.label })) }
+  }
+}
+
+async function handleResultsMonth(data, n) {
+  const lang = langOf(data)
+  const periods = data._periods || []
+  const num = parseInt(n)
+  const all = num === periods.length + 1 || /^all$/i.test(n)
+  if (!all && (isNaN(num) || num < 1 || num > periods.length)) {
+    return invalidReply(data, 'pick_results_month')
+  }
+  const { data: results } = await supabase.from('student_results')
+    .select('*').eq('student_id', data.student_id)
+  let rows = results || []
+  let labelEn = 'All', labelSw = 'yote'
+  if (!all) {
+    const per = periods[num - 1]
+    rows = rows.filter(r => periodInfo(r).key === per.key)
+    labelEn = per.en
+    labelSw = per.sw
+  }
+  if (!rows.length) return invalidReply(data, 'pick_results_month')
+
+  const bySubj = {}
+  rows.forEach(r => {
+    if (!bySubj[r.subject]) bySubj[r.subject] = []
+    bySubj[r.subject].push(Math.round((r.marks_scored / r.total_marks) * 100))
+  })
+  let body = ''
+  const avgs = []
+  Object.entries(bySubj).sort().forEach(([subj, pcts]) => {
+    const avg = Math.round(pcts.reduce((a, b) => a + b, 0) / pcts.length)
+    body += `${subj}: ${avg}% ${gradeLabel(avg)}\n`
+    avgs.push(avg)
+  })
+  if (avgs.length) {
+    const overall = Math.round(avgs.reduce((a, b) => a + b, 0) / avgs.length)
+    body += (lang === 'sw' ? 'Wastani' : 'Overall') + `: ${overall}% ${gradeLabel(overall)}\n`
+  }
+  const shared = lang === 'sw' ? `Matokeo ya ${labelSw} yametumwa` : `${labelEn} results shared`
+  return {
+    text: `SchoolPay\n\n${shared}\n\n${data.student_name}\n${body}\n${HOME[lang]}`,
+    nextStep: 'main_menu',
+    sessionData: { lang: data.lang }
+  }
+}
+
+// ── Help ──────────────────────────────────────────────────────
+function helpListedMenu(data) {
+  const lang = langOf(data)
+  const kids = data._children || []
+  let msg = `SchoolPay\n\n`
+  kids.forEach((k, i) => {
+    msg += lang === 'sw'
+      ? `${i + 1}. ${k.name} sio mwanangu\n`
+      : `${i + 1}. ${k.name} is not my child\n`
+  })
+  msg += lang === 'sw'
+    ? `${kids.length + 1}. Niko na mtoto mwingine katika shule hii\n`
+    : `${kids.length + 1}. I have another child in this school\n`
+  msg += `\n${BACK[lang]}`
+  return { text: msg, nextStep: 'help_menu', sessionData: data }
+}
+
+function helpMissingMenu(data) {
+  const lang = langOf(data)
+  const intro = lang === 'sw'
+    ? 'Hakuna mtoto aliyeunganishwa na nambari hii.'
+    : 'No child is linked to this phone number.'
+  const opt = lang === 'sw'
+    ? '1. Sioni jina la mwanangu katika orodha'
+    : '1. I cannot see my child listed'
+  return {
+    text: `SchoolPay\n\n${intro}\n\n${opt}\n\n${BACK[lang]}`,
+    nextStep: 'help_menu',
+    sessionData: { lang: data.lang, _children: [] }
+  }
+}
+
+async function handleHelpChoice(data, n, phone) {
+  const lang = langOf(data)
+  const kids = data._children || []
+  const num = parseInt(n)
+  let issue = null
+  if (!kids.length) {
+    if (num === 1) issue = 'Cannot see their child listed for this phone number'
+  } else if (num >= 1 && num <= kids.length) {
+    issue = `"${kids[num - 1].name}" is not my child`
+  } else if (num === kids.length + 1) {
+    issue = 'Has another child in this school not yet linked'
+  }
+  if (!issue) return invalidReply(data, 'help_menu')
+  logHelpRequest(phone, issue).catch(() => {})
+  const txt = lang === 'sw'
+    ? 'Asante. Ofisi ya shule imearifiwa na itawasiliana nawe hivi karibuni.'
+    : 'Thank you. The school office has been notified and will contact you shortly.'
+  return { text: `SchoolPay\n\n${txt}\n\n${HOME[lang]}`, nextStep: 'main_menu', sessionData: { lang: data.lang } }
+}
+
 // Email transporter (SMTP — set EMAIL_HOST, EMAIL_USER, EMAIL_PASS in Render env)
 const emailTransporter = nodemailer.createTransport({
   host:   process.env.EMAIL_HOST || 'smtp.gmail.com',
@@ -86,8 +560,10 @@ function normalizeInput(raw) {
   if (/^6$/.test(s)) return '6'
   if (/^all$/.test(s)) return 'all'
 
-  // Back / go back
-  if (/^(back|bck|bak|bac|bakc|go\s*back)$/.test(s)) return '0'
+  // Back / go back — '*' per the Figma flows, plus Swahili
+  if (/^\*+$/.test(s)) return '0'
+  if (/^(rudi\s*mwanzo|mwanzo)$/.test(s)) return '6'
+  if (/^(back|bck|bak|bac|bakc|go\s*back|rudi|nyuma)$/.test(s)) return '0'
 
   // Menu
   if (/^(menu|mnu|men|main|maenu|meun)$/.test(s)) return '6'
@@ -165,6 +641,7 @@ async function buildSuccessMessage(studentId, paidAmount, feeLabel, ref, email, 
         })
         remainingSection += `\n\n💰 *Total Remaining: KES ${totalRemaining.toLocaleString()}*`
         remainingSection += `\n\n_Please clear remaining fees before their deadlines._`
+        remainingSection += `\n📆 _You can clear the rest in installments (40% / 40% / 20% across the term) — type *hi* to pay._`
       }
     }
   } catch (e) {
@@ -203,7 +680,7 @@ app.post('/webhook/whatsapp', async (req, res) => {
 
   try {
     const session = await getSession(phone)
-    const reply = await handleMessage(session, body, phone)
+    const reply = await handleMessage(session, body, phone, 'wa')
     await updateSession(phone, reply.nextStep, reply.sessionData || {})
     replyText = reply.text
   } catch (err) {
@@ -226,7 +703,7 @@ app.post('/webhook/sms', async (req, res) => {
   console.log(`[SMS IN] From: ${phone} | Text: ${body}`)
   try {
     const session = await getSession(phone)
-    const reply = await handleMessage(session, body, phone)
+    const reply = await handleMessage(session, body, phone, 'sms')
     await updateSession(phone, reply.nextStep, reply.sessionData || {})
     await sendSMS(phone, stripMarkdown(reply.text))
   } catch (err) {
@@ -260,9 +737,286 @@ app.post('/webhook/ussd', async (req, res) => {
 })
 
 // ============================================================
-// USSD FLOW
+// USSD FLOW — Figma flows 2014-167 (EN) / 2014-164 (SW)
 // ============================================================
 async function handleUSSD(sessionId, phone, parts) {
+  // Menu option 4 toggles the language; each leading '4' flips it
+  let lang = 'en'
+  while (parts.length && parts[0] === '4') {
+    lang = lang === 'en' ? 'sw' : 'en'
+    parts = parts.slice(1)
+  }
+  const sw = lang === 'sw'
+  const depth = parts.length
+  const p = (i) => parts[i] || ''
+
+  if (depth === 0 || (depth === 1 && p(0) === '')) {
+    return sw
+      ? 'CON SchoolPay\n1. Lipa karo\n2. Karo idaiwayo\n3. Matokeo ya elimu\n4. Back to english'
+      : 'CON SchoolPay\n1. Pay Fees\n2. Check fee balance\n3. Academic results\n4. Badili lugha'
+  }
+
+  const choice = p(0)
+  if (choice === '0') return sw ? 'END Asante kwa kutumia SchoolPay!' : 'END Thank you for using SchoolPay!'
+  if (!['1', '2', '3'].includes(choice)) {
+    return sw ? 'END Chaguo si sahihi. Jaribu tena.' : 'END Invalid option. Please try again.'
+  }
+
+  const INVALID = sw ? 'END Chaguo si sahihi.' : 'END Invalid option.'
+  const THANKS  = sw
+    ? 'END Asante. Ofisi ya shule imearifiwa na itawasiliana nawe hivi karibuni.'
+    : 'END Thank you. The school office has been notified and will contact you shortly.'
+
+  // Every flow starts from the children linked to this phone number
+  const children = await findChildrenByPhone(phone)
+
+  if (depth === 1) {
+    if (!children.length) {
+      return sw
+        ? 'CON SchoolPay\nHakuna mtoto kwenye nambari hii.\n1. Sioni jina la mwanangu katika orodha'
+        : 'CON SchoolPay\nNo child is linked to this phone.\n1. I cannot see my child listed'
+    }
+    let msg = 'CON SchoolPay\n'
+    children.forEach((c, i) => { msg += `${i + 1}. ${c.first_name} ${c.last_name} - ${SCHOOL_LABEL()}\n` })
+    msg += `${children.length + 1}. ${sw ? 'Msaada' : 'Help'}`
+    return msg
+  }
+
+  const pick = parseInt(p(1))
+
+  // Help — no child linked to this phone
+  if (!children.length) {
+    if (pick === 1) {
+      logHelpRequest(phone, 'USSD: cannot see their child listed for this phone number').catch(() => {})
+      return THANKS
+    }
+    return INVALID
+  }
+
+  // Help — a child is listed but wrong/missing
+  if (pick === children.length + 1) {
+    if (depth === 2) {
+      let msg = 'CON SchoolPay\n'
+      children.forEach((c, i) => {
+        msg += sw
+          ? `${i + 1}. ${c.first_name} ${c.last_name} sio mwanangu\n`
+          : `${i + 1}. ${c.first_name} ${c.last_name} is not my child\n`
+      })
+      msg += sw
+        ? `${children.length + 1}. Niko na mtoto mwingine`
+        : `${children.length + 1}. I have another child in this school`
+      return msg
+    }
+    const h = parseInt(p(2))
+    const issue = h >= 1 && h <= children.length
+      ? `USSD: "${children[h - 1].first_name} ${children[h - 1].last_name}" is not my child`
+      : 'USSD: has another child in this school not yet linked'
+    logHelpRequest(phone, issue).catch(() => {})
+    return THANKS
+  }
+
+  if (isNaN(pick) || pick < 1 || pick > children.length) return INVALID
+  const student = children[pick - 1]
+  const studentName = `${student.first_name} ${student.last_name}`
+  const mon  = monthName(new Date(), lang)
+  const term = termLabel(lang)
+
+  // ── FEE PAYMENT ───────────────────────────────────────────
+  if (choice === '1') {
+    const { data: allFees } = await supabase.from('v_student_fee_summary')
+      .select('*').eq('student_id', student.id).order('fee_category')
+    const outstanding = (allFees || []).filter(f => Number(f.balance) > 0)
+    if (!outstanding.length) {
+      return sw
+        ? `END ${studentName} hana salio la karo. Karo yote imelipwa.`
+        : `END ${studentName} has no outstanding fees. All fees are cleared.`
+    }
+    const termTotal = outstanding.reduce((s, f) => s + Number(f.balance), 0)
+    const instTotal = buildInstallmentSelection(outstanding).total
+
+    if (depth === 2) {
+      return sw
+        ? `CON SchoolPay\nPayment progress\n1. Lipa pole pole\n2. Lipa salio lote la ${term.toLowerCase()}`
+        : `CON SchoolPay\nPayment progress\n1. Lipa pole pole\n2. Pay all ${term} fees`
+    }
+
+    const plan = p(2)
+    if (!['1', '2'].includes(plan)) return INVALID
+    const shown = plan === '1' ? instTotal : termTotal
+    const shownLabel = plan === '1'
+      ? (sw ? `Salio la ${mon} Ksh ${shown.toLocaleString()}` : `${mon} balance Ksh ${shown.toLocaleString()}`)
+      : (sw ? `Salio la ${term.toLowerCase()} Ksh ${shown.toLocaleString()}` : `${term} full balance Ksh ${shown.toLocaleString()}`)
+
+    if (depth === 3) {
+      return sw
+        ? `CON SchoolPay\n${shownLabel}\n1. Lipa pesa yote\nau andika kiasi, mfano 3000`
+        : `CON SchoolPay\n${shownLabel}\n1. Pay full balance\nor enter amount e.g 3000`
+    }
+
+    const amtInput = p(3)
+    const amount = amtInput === '1' ? shown : parseAmount(amtInput)
+    if (!amount || amount <= 0 || amount > termTotal) {
+      return sw ? 'END Kiasi si sahihi. Piga tena.' : 'END Invalid amount. Please dial again.'
+    }
+
+    if (depth === 4) {
+      return sw
+        ? 'CON SchoolPay\nAndika nambari ya M-Pesa kwa ajili ya malipo'
+        : 'CON SchoolPay\nEnter M-Pesa number for payment'
+    }
+
+    if (depth === 5) {
+      const msisdn = p(4)
+      const digits = msisdn.replace(/\D/g, '')
+      if (digits.length < 9 || digits.length > 12) {
+        return sw ? 'END Nambari si sahihi. Piga tena.' : 'END Invalid number. Please dial again.'
+      }
+      const paystackPhone = toPaystackPhone(msisdn)
+      const ref = generateRef()
+      const selected = allocateAmount(outstanding, amount)
+      const feeLabel = `${termLabel('en')} fees${plan === '1' ? ' — Lipa pole pole' : ''}`
+      try {
+        await axios.post('https://api.paystack.co/charge', {
+          email: `ussd-${phone.replace(/\D/g, '')}@schoolpay.ke`,
+          amount: Math.round(amount * 100),
+          currency: 'KES', reference: ref,
+          mobile_money: { phone: paystackPhone, provider: 'mpesa' },
+          metadata: {
+            school_id: SCHOOL_ID, student_id: student.id,
+            student_name: studentName, guardian_name: student.guardian1_name || 'Guardian',
+            fee_label: feeLabel,
+            fee_ids: selected.map(f => f.student_fee_id).join(','),
+            guardian_phone: phone, channel: 'ussd_mpesa'
+          }
+        }, { headers: { Authorization: `Bearer ${PAYSTACK_SECRET}`, 'Content-Type': 'application/json' } })
+
+        await savePendingUSSD({
+          student_id: student.id, student_name: studentName,
+          guardian_name: student.guardian1_name || 'Guardian',
+          selected_fees: selected
+        }, ref, 'mpesa')
+
+        return sw
+          ? `END SchoolPay\nConfirmation\nOmbi limetumwa kwa ${paystackPhone}. Weka PIN ya M-Pesa kulipa Ksh ${amount.toLocaleString()}.\nRef: ${ref}`
+          : `END SchoolPay\nConfirmation\nSTK push sent to ${paystackPhone}. Enter your M-Pesa PIN to pay Ksh ${amount.toLocaleString()}.\nRef: ${ref}`
+      } catch (err) {
+        const msg = err.response?.data?.message || 'Payment failed'
+        return sw ? `END M-Pesa imeshindikana:\n${msg}\nPiga tena.` : `END M-Pesa failed:\n${msg}\nDial again to retry.`
+      }
+    }
+    return INVALID
+  }
+
+  // ── CHECK FEE BALANCE ─────────────────────────────────────
+  if (choice === '2') {
+    const { data: allFees } = await supabase.from('v_student_fee_summary')
+      .select('*').eq('student_id', student.id).order('fee_category')
+    const outstanding = (allFees || []).filter(f => Number(f.balance) > 0)
+    const termTotal = outstanding.reduce((s, f) => s + Number(f.balance), 0)
+    const instTotal = buildInstallmentSelection(outstanding).total
+
+    if (depth === 2) {
+      const lines = !outstanding.length
+        ? (sw ? 'Karo yote imelipwa. Hakuna salio.' : 'All fees are cleared. No balance due.')
+        : (sw
+            ? `Salio la ${mon} ni Ksh ${instTotal.toLocaleString()}\nSalio la ${term} ni Ksh ${termTotal.toLocaleString()}`
+            : `${mon} balance Ksh ${instTotal.toLocaleString()}\n${term} full balance Ksh ${termTotal.toLocaleString()}`)
+      return `CON SchoolPay\n${lines}\n1. ${sw ? 'Risiti ya malipo' : 'Payment Statement'}`
+    }
+
+    if (p(2) === '1') {
+      const { data: payments } = await supabase.from('payments')
+        .select('amount, payment_method, created_at')
+        .eq('student_id', student.id).eq('status', 'success')
+        .order('created_at', { ascending: false })
+
+      if (!payments || !payments.length) {
+        return sw
+          ? `END ${studentName}\nHakuna malipo yaliyorekodiwa bado.`
+          : `END ${studentName}\nNo payments recorded yet.`
+      }
+
+      let smsBody = `${studentName} — ${sw ? 'Risiti ya malipo' : 'Payment Statement'}\n`
+      payments.slice(0, 10).forEach(pm => {
+        const d = new Date(pm.created_at).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })
+        smsBody += `${d}  Ksh ${Number(pm.amount).toLocaleString()}  ${pm.payment_method}\n`
+      })
+      const total = payments.reduce((s, pm) => s + Number(pm.amount), 0)
+      smsBody += sw ? `Jumla: Ksh ${total.toLocaleString()}` : `Total paid: Ksh ${total.toLocaleString()}`
+      sendSMS(phone, smsBody).catch(() => {})
+
+      return sw
+        ? `END SchoolPay\nRisiti ya malipo imetumwa kwa SMS.\nJumla: Ksh ${total.toLocaleString()}`
+        : `END SchoolPay\nPayment Statement shared via SMS.\nTotal paid: Ksh ${total.toLocaleString()}`
+    }
+    return INVALID
+  }
+
+  // ── ACADEMIC RESULTS ──────────────────────────────────────
+  if (choice === '3') {
+    const { data: results } = await supabase.from('student_results')
+      .select('*').eq('student_id', student.id)
+    if (!results || !results.length) {
+      return sw
+        ? `END Hakuna matokeo ya ${studentName} bado.`
+        : `END No results recorded for ${studentName} yet.`
+    }
+    const seen = new Set()
+    let periods = []
+    results.forEach(r => {
+      const pi = periodInfo(r)
+      if (!seen.has(pi.key)) { seen.add(pi.key); periods.push(pi) }
+    })
+    periods.sort((a, b) => b.sort - a.sort)
+    periods = periods.slice(0, 5)
+
+    if (depth === 2) {
+      const ready = sw ? `Matokeo ya ${periods[0].sw} tayari` : `${periods[0].en} results ready`
+      let msg = `CON SchoolPay\n${ready}\n`
+      periods.forEach((pr, i) => { msg += `${i + 1}. ${pr.label}\n` })
+      msg += `${periods.length + 1}. All`
+      return msg
+    }
+
+    const sel = parseInt(p(2))
+    const allSel = sel === periods.length + 1
+    if (!allSel && (isNaN(sel) || sel < 1 || sel > periods.length)) return INVALID
+    let rows = results
+    let labelEn = 'All', labelSw = 'yote'
+    if (!allSel) {
+      const per = periods[sel - 1]
+      rows = results.filter(r => periodInfo(r).key === per.key)
+      labelEn = per.en
+      labelSw = per.sw
+    }
+
+    const bySubj = {}
+    rows.forEach(r => {
+      if (!bySubj[r.subject]) bySubj[r.subject] = []
+      bySubj[r.subject].push(Math.round((r.marks_scored / r.total_marks) * 100))
+    })
+    let msg = sw
+      ? `END SchoolPay\nMatokeo ya ${labelSw} yametumwa\n${studentName}\n`
+      : `END SchoolPay\n${labelEn} results shared\n${studentName}\n`
+    const avgs = []
+    Object.entries(bySubj).forEach(([subj, pcts]) => {
+      const avg = Math.round(pcts.reduce((a, b) => a + b, 0) / pcts.length)
+      const short = subj.length > 10 ? subj.substring(0, 10) + '.' : subj
+      msg += `${short}: ${avg}% ${gradeLabel(avg)}\n`
+      avgs.push(avg)
+    })
+    if (avgs.length) {
+      const overall = Math.round(avgs.reduce((a, b) => a + b, 0) / avgs.length)
+      msg += `${sw ? 'Wastani' : 'Overall'}: ${overall}% ${gradeLabel(overall)}`
+    }
+    return msg
+  }
+
+  return INVALID
+}
+
+// Legacy admission-number USSD flow (superseded by the Figma flows above)
+async function handleUSSDLegacy(sessionId, phone, parts) {
   const depth = parts.length
   const p = (i) => parts[i] || ''
 
@@ -335,12 +1089,31 @@ async function handleUSSD(sessionId, phone, parts) {
         label = fees[idx].fee_name
       }
 
+      const inst = buildInstallmentSelection(selectedFees)
       await saveUssdSession(sessionId, { ...ussdData, selected_fees: selectedFees, total_amount: total, fee_label: label })
-      return `CON ${label}\nKES ${total.toLocaleString()}\n\n1. M-Pesa STK Push\n2. Bank Transfer\n0. Back`
+      return `CON ${label}\nTotal: KES ${total.toLocaleString()}\n\n1. Pay Full Amount\n2. Installments 40/40/20\n   (KES ${inst.total.toLocaleString()} now)`
     }
 
     if (depth === 4) {
-      const methodChoice = p(3)
+      const planChoice = p(3)
+      const ussdData = await getUssdSession(sessionId)
+      if (planChoice === '1') {
+        const fees = (ussdData.selected_fees || []).map(f => ({ ...f, pay_amount: Number(f.balance) }))
+        const total = fees.reduce((s, f) => s + f.pay_amount, 0)
+        await saveUssdSession(sessionId, { ...ussdData, selected_fees: fees, total_amount: total })
+        return `CON ${ussdData.fee_label}\nKES ${total.toLocaleString()}\n\n1. M-Pesa STK Push\n2. Bank Transfer\n0. Back`
+      }
+      if (planChoice === '2') {
+        const inst = buildInstallmentSelection(ussdData.selected_fees || [])
+        const label = `${ussdData.fee_label} (Inst ${inst.number}/3)`
+        await saveUssdSession(sessionId, { ...ussdData, selected_fees: inst.selected, total_amount: inst.total, fee_label: label })
+        return `CON Installment ${inst.number} of 3\nPay now: KES ${inst.total.toLocaleString()}\nRest spread over the term\n\n1. M-Pesa STK Push\n2. Bank Transfer\n0. Back`
+      }
+      return 'CON Choose plan:\n1. Pay Full Amount\n2. Installments 40/40/20'
+    }
+
+    if (depth === 5) {
+      const methodChoice = p(4)
       const ussdData = await getUssdSession(sessionId)
       if (methodChoice === '1') return 'CON Enter M-Pesa number:\n(e.g. 0712345678)'
       if (methodChoice === '2') {
@@ -351,9 +1124,9 @@ async function handleUSSD(sessionId, phone, parts) {
       return 'CON Choose:\n1. M-Pesa\n2. Bank Transfer'
     }
 
-    if (depth === 5) {
-      const methodChoice = p(3)
-      const mpesaPhone = p(4)
+    if (depth === 6) {
+      const methodChoice = p(4)
+      const mpesaPhone = p(5)
       const ussdData = await getUssdSession(sessionId)
       if (methodChoice === '1') {
         const digits = mpesaPhone.replace(/\D/g, '')
@@ -561,7 +1334,8 @@ async function savePendingUSSD(ussdData, ref, method) {
     try {
       await supabase.from('payments').insert({
         school_id: SCHOOL_ID, student_id: ussdData.student_id,
-        student_fee_id: fee.student_fee_id, amount: Number(fee.balance),
+        student_fee_id: fee.student_fee_id,
+        amount: Number(fee.pay_amount != null ? fee.pay_amount : fee.balance),
         payment_method: method, paystack_reference: ref,
         paid_by_name: ussdData.guardian_name || 'Guardian', status: 'pending'
       })
@@ -572,7 +1346,7 @@ async function savePendingUSSD(ussdData, ref, method) {
 // ============================================================
 // MESSAGE HANDLER — shared by WhatsApp + SMS
 // ============================================================
-async function handleMessage(session, body, phone) {
+async function handleMessage(session, body, phone, channel = 'wa') {
   const n    = normalizeInput(body)   // typo-tolerant normalised version
   const raw  = body.trim()            // original text (for free-form inputs)
   const step = session.current_step || 'main_menu'
@@ -580,54 +1354,36 @@ async function handleMessage(session, body, phone) {
   const hist = data._hist            || []
 
   // ── Always-available shortcuts (work from any step) ──────────
-  if (n === 'balance')    return await showBalance(data, phone)
-  if (n === 'results')    return await showResults(data, phone)
-  if (n === 'statements') return await showStatements(data, phone)
+  if (n === 'balance')    return await startFlow(data, phone, 'balance')
+  if (n === 'results')    return await startFlow(data, phone, 'results')
+  if (n === 'statements') return await startFlow(data, phone, 'balance')
 
-  // ── Main menu / restart ──────────────────────────────────────
+  // ── Main menu / restart (Home) ───────────────────────────────
   if (n === 'hi' || n === '6' || n === 'menu') {
     await resetSession(phone)
-    // Welcome back if student already identified in previous session
-    if (data.student_id || data.student_name) {
-      return mainMenu(data)   // carries name for personalised greeting
-    }
-    return mainMenu({})
+    return mainMenu({ lang: data.lang })
   }
 
-  // ── Go back one step ─────────────────────────────────────────
+  // ── Go back one step ('*' / 0 / back / rudi) ─────────────────
   if (n === '0' || n === 'back') {
-    if (hist.length === 0) return mainMenu(data)
+    if (hist.length === 0) return mainMenu({ lang: data.lang })
     const prev = hist[hist.length - 1]
     const restoredData = { ...prev.data, _hist: hist.slice(0, -1) }
-    return getStepPrompt(prev.step, restoredData)
+    return await getStepPrompt(prev.step, restoredData, phone)
   }
 
   // ── Process current step ─────────────────────────────────────
   let result
   switch (step) {
-    case 'main_menu':           result = await handleMainMenuChoice(data, n, raw, phone); break
-    case 'ask_email':           result = askEmail(data, raw); break
-    case 'ask_admission':       result = await askAdmission(data, raw); break
-    case 'show_fees':           result = showFees(data, raw); break
-    case 'choose_method':       result = chooseMethod(data, n); break
-    case 'ask_mpesa_phone':     result = await doMpesa(data, raw, phone); break
-    case 'card_number':         result = cardNumber(data, raw); break
-    case 'card_expiry':         result = cardExpiry(data, raw); break
-    case 'card_cvv':            result = await cardCvv(data, raw, phone); break
-    case 'ask_results_adm':        result = await handleResultsAdmission(data, raw); break
-    case 'pick_results_period':    result = await handleResultsPeriod(data, n || raw); break
-    case 'ask_transcript_consent': result = await handleTranscriptConsent(data, n, phone); break
-    case 'confirm_transcript_email': result = await handleConfirmTranscriptEmail(data, n, phone); break
-    case 'ask_transcript_email':   result = await handleTranscriptEmail(data, raw, phone); break
-    case 'ask_statement_adm':        result = await handleStatementAdm(data, raw); break
-    case 'pick_stmt_month':          result = await handleStatementMonth(data, n, raw); break
-    case 'ask_stmt_pdf_consent':     result = await handleStmtPDFConsent(data, n, phone); break
-    case 'confirm_stmt_pdf_email':   result = await handleConfirmStmtPDFEmail(data, n, phone); break
-    case 'ask_stmt_pdf_email':       result = await handleStmtPDFEmail(data, raw, phone); break
-    case 'ask_balance_pdf_consent':  result = await handleBalancePDFConsent(data, n, phone); break
-    case 'confirm_balance_pdf_email': result = await handleConfirmBalancePDFEmail(data, n, phone); break
-    case 'ask_balance_pdf_email':    result = await handleBalancePDFEmail(data, raw, phone); break
-    default:                         result = mainMenu(data)
+    case 'main_menu':          result = await handleMainMenuChoice(data, n, phone); break
+    case 'pick_child':         result = await handleChildPick(data, n, phone); break
+    case 'payment_progress':   result = await handleProgressChoice(data, n); break
+    case 'ask_amount':         result = await handleAmount(data, n, raw); break
+    case 'ask_mpesa_phone':    result = await doMpesa(data, raw, phone); break
+    case 'balance_menu':       result = await handleBalanceMenu(data, n, phone, channel); break
+    case 'pick_results_month': result = await handleResultsMonth(data, n); break
+    case 'help_menu':          result = await handleHelpChoice(data, n, phone); break
+    default:                   result = mainMenu({ lang: data.lang })
   }
 
   // ── History tracking ─────────────────────────────────────────
@@ -643,82 +1399,34 @@ async function handleMessage(session, body, phone) {
   return result
 }
 
-// Handles 1/2/3/4 from the main menu
-async function handleMainMenuChoice(data, n, raw, phone) {
+// Handles 1/2/3/4 from the main menu (4 = Badili lugha / Back to english)
+async function handleMainMenuChoice(data, n, phone) {
   switch (n) {
-    case '1': return {
-      text: `💳 *Pay Fees*\n━━━━━━━━━━━━━━━━━━━━\n\nPlease enter your *email address* to receive your payment receipt.\n\n  📧 _(e.g. parent@gmail.com)_\n\nNo email? Type *skip* — we'll use the school's email.\n\n_*0* back · *6* menu_`,
-      nextStep: 'ask_email', sessionData: {}
+    case '1': return await startFlow(data, phone, 'pay')
+    case '2': return await startFlow(data, phone, 'balance')
+    case '3': return await startFlow(data, phone, 'results')
+    case '4': return mainMenu({ lang: langOf(data) === 'sw' ? 'en' : 'sw' })
+    default: {
+      const txt = langOf(data) === 'sw'
+        ? 'Tafadhali andika nambari 1 hadi 4.'
+        : 'Please reply with a number 1 to 4.'
+      return { text: `SchoolPay\n\n${txt}`, nextStep: 'main_menu', sessionData: data }
     }
-    case '2': {
-      // If student already in session, show balance directly
-      if (data.student_id) return await showBalance(data, phone)
-      return {
-        text: `📊 *Check Fee Balance*\n━━━━━━━━━━━━━━━━━━━━\n\nEnter the student's *Admission Number*:\n\n  🎓 _(e.g. ADM/2025/001)_\n\n_*0* back · *6* menu_`,
-        nextStep: 'ask_admission', sessionData: { ...data, _balance_only: true }
-      }
-    }
-    case '3': return await showResults(data, phone)
-    case '4': return await showStatements(data, phone)
-    default:
-      return {
-        text: `Please type a number to select:\n\n  *1* · 2 · 3 · 4\n\n_*6* for main menu_`,
-        nextStep: 'main_menu', sessionData: data
-      }
   }
 }
 
 // Re-renders the prompt for a step when user goes back
-function getStepPrompt(step, data) {
+async function getStepPrompt(step, data, phone) {
   switch (step) {
-    case 'main_menu': return mainMenu(data)
-
-    case 'ask_email': return {
-      text: `📧 *Enter Your Email Address*\n\nPlease provide your email so we can send your payment receipt.\n\n  _(e.g. parent@gmail.com)_\n\n_*6* for main menu_`,
-      nextStep: 'ask_email', sessionData: data
-    }
-
-    case 'ask_admission': return {
-      text: `✅ Email on file: _${data.email}_\n\n🎓 *Enter Student Admission Number*\n\n  _(e.g. ADM/2025/001)_\n\n_*0* back · *6* menu_`,
-      nextStep: 'ask_admission', sessionData: data
-    }
-
-    case 'show_fees': {
-      const fees = data.fees || []
-      if (!fees.length) return mainMenu(data)
-      const total = fees.reduce((s, f) => s + Number(f.balance), 0)
-      let msg = `📋 *Outstanding Fees*\n━━━━━━━━━━━━━━━━━━━━\n\n👤 *${data.student_name}*\n\n`
-      fees.forEach((f, i) => {
-        msg += `  *${i + 1}.* ${f.fee_name}\n`
-        msg += `       *KES ${Number(f.balance).toLocaleString()}*\n\n`
-      })
-      msg += `━━━━━━━━━━━━━━━━━━━━\n💰 *Total Due: KES ${total.toLocaleString()}*\n━━━━━━━━━━━━━━━━━━━━\n\n`
-      msg += `Reply with:\n  • A *number* to pay one fee _(e.g. 1)_\n  • *1,2* or *1,3* to pay multiple\n  • *ALL* to pay everything at once\n\n`
-      msg += `_*0* back · *6* menu_`
-      return { text: msg, nextStep: 'show_fees', sessionData: data }
-    }
-
-    case 'choose_method': return {
-      text: `💳 *Payment Summary*\n━━━━━━━━━━━━━━━━━━━━\n\n  👤 ${data.student_name}\n  📋 ${data.fee_label}\n  💰 *KES ${Number(data.total_amount).toLocaleString()}*\n\n━━━━━━━━━━━━━━━━━━━━\n*Select Payment Method:*\n\n  *1* 📱  M-Pesa STK Push\n  *2* 💳  Card _(Visa / Mastercard)_\n  *3* 🏦  Bank Transfer\n\n━━━━━━━━━━━━━━━━━━━━\n_*0* back · *6* menu_`,
-      nextStep: 'choose_method', sessionData: data
-    }
-
-    case 'ask_mpesa_phone': return {
-      text: `📱 *M-Pesa Payment*\n━━━━━━━━━━━━━━━━━━━━\n\n  💰 *KES ${Number(data.total_amount).toLocaleString()}*\n  📋 ${data.fee_label}\n\nEnter the *M-Pesa number* to receive the payment prompt:\n\n  _(e.g. 0712 345 678)_\n\n_*0* back · *6* menu_`,
-      nextStep: 'ask_mpesa_phone', sessionData: data
-    }
-
-    case 'card_number': return {
-      text: `💳 *Card Payment — Step 1 of 3*\n━━━━━━━━━━━━━━━━━━━━\n\nPlease enter your *16-digit card number*:\n\n  _(No spaces — e.g. 4111 1111 1111 1111)_\n\n🔒 _Secured by Paystack_\n\n_*0* back · *6* menu_`,
-      nextStep: 'card_number', sessionData: data
-    }
-
-    case 'card_expiry': return {
-      text: `💳 *Card Payment — Step 2 of 3*\n━━━━━━━━━━━━━━━━━━━━\n\nEnter your card *Expiry Date*:\n\n  _(MM/YY — e.g. 12/26)_\n\n_*0* back · *6* menu_`,
-      nextStep: 'card_expiry', sessionData: data
-    }
-
-    default: return mainMenu(data)
+    case 'main_menu':          return mainMenu(data)
+    case 'pick_child':         return await startFlow(data, phone, data._purpose || 'pay')
+    case 'payment_progress':   return await paymentProgressMenu(data)
+    case 'ask_amount':         return amountScreen(data)
+    case 'ask_mpesa_phone':    return mpesaPrompt(data)
+    case 'balance_menu':       return await balanceScreen(data)
+    case 'pick_results_month': return await resultsMonthMenu(data)
+    case 'help_menu':          return (data._children || []).length ? helpListedMenu(data) : helpMissingMenu(data)
+    default:                   return mainMenu(data)
   }
 }
 
@@ -2246,6 +2954,7 @@ async function showBalance(data, phone) {
       })
       msg += `━━━━━━━━━━━━━━━━━━━━\n`
       msg += `💰 *Total Remaining: KES ${totalOwed.toLocaleString()}*\n`
+      msg += `\n📆 _Tip: You can pay in *installments* — 40% this month, 40% next month, 20% in the final month of the term. Type *1* to start._\n`
       if (cleared.length > 0) {
         msg += `\n✅ *Cleared (${cleared.length}):* `
         msg += cleared.map(f => f.fee_name).join(', ')
@@ -2271,7 +2980,8 @@ async function showBalance(data, phone) {
   }
 }
 
-function mainMenu(data = {}) {
+// Legacy rich menu (superseded by the Figma main menu defined above)
+function mainMenuLegacy(data = {}) {
   const name = data.student_name || data.results_student_name || null
   const greeting = name
     ? `Welcome back! 👋\n\n  👤 *${name}*\n\nWhat would you like to do?`
@@ -2403,10 +3113,75 @@ function showFees(data, body) {
       : selected.map(f => f.fee_name).join(' + ')
   }
 
+  return planMenu({ ...data, selected_fees: selected, total_amount: total, fee_label: label })
+}
+
+// ── Payment plan menu: full amount vs 40/40/20 installments ──
+function planMenu(data) {
+  const selected = data.selected_fees || []
+  const total    = Number(data.total_amount)
+  const inst     = buildInstallmentSelection(selected)
+
+  let msg = `💳 *Payment Plan*\n━━━━━━━━━━━━━━━━━━━━\n\n`
+  msg += `  👤 *${data.student_name}*\n`
+  msg += `  📋 ${data.fee_label}\n`
+  msg += `  💰 Total: *KES ${total.toLocaleString()}*\n\n`
+  msg += `━━━━━━━━━━━━━━━━━━━━\n`
+  msg += `*How would you like to pay?*\n\n`
+  msg += `  *1* 💰  Full Amount\n`
+  msg += `       _KES ${total.toLocaleString()} once_\n\n`
+  msg += `  *2* 📆  Installments — *40% / 40% / 20%*\n`
+  msg += `       _Spread over the 3 months of the term_\n`
+  msg += `       _Pay *KES ${inst.total.toLocaleString()}* now (installment ${inst.number} of 3)_\n\n`
+  msg += `━━━━━━━━━━━━━━━━━━━━\n_*0* back · *6* menu_`
+
+  return { text: msg, nextStep: 'choose_plan', sessionData: data }
+}
+
+function choosePlan(data, body) {
+  const c = body.trim()
+  const selected = data.selected_fees || []
+  if (!selected.length) return mainMenu(data)
+
+  if (c === '1') {
+    // Full amount — each fee paid down to zero
+    const fees  = selected.map(f => ({ ...f, pay_amount: Number(f.balance) }))
+    const total = fees.reduce((s, f) => s + f.pay_amount, 0)
+    return methodMenu({ ...data, selected_fees: fees, total_amount: total, plan: 'full' })
+  }
+
+  if (c === '2') {
+    const inst = buildInstallmentSelection(selected)
+    if (inst.total <= 0) return methodMenu(data)
+    const baseLabel = (data.fee_label || '').replace(/ — Installment \d\/3$/, '')
+    let msg = `📆 *Installment Plan — 40% / 40% / 20%*\n━━━━━━━━━━━━━━━━━━━━\n\n`
+    msg += `  👤 *${data.student_name}*\n`
+    msg += `  📋 ${baseLabel}\n\n`
+    msg += installmentScheduleText(selected, inst.number)
+    msg += `\n💰 *Pay now: KES ${inst.total.toLocaleString()}* _(installment ${inst.number} of 3)_\n`
+    msg += `━━━━━━━━━━━━━━━━━━━━\n`
+    const next = methodMenu({
+      ...data,
+      selected_fees: inst.selected,
+      total_amount:  inst.total,
+      fee_label:     `${baseLabel} — Installment ${inst.number}/3`,
+      plan:          'installment'
+    })
+    return { ...next, text: msg + '\n' + next.text }
+  }
+
   return {
-    text: `💳 *Payment Summary*\n━━━━━━━━━━━━━━━━━━━━\n\n  👤 *${data.student_name}*\n  📋 ${label}\n  💰 *KES ${total.toLocaleString()}*\n\n━━━━━━━━━━━━━━━━━━━━\n*Select Payment Method:*\n\n  *1* 📱  M-Pesa STK Push\n  *2* 💳  Card _(Visa / Mastercard)_\n  *3* 🏦  Bank Transfer\n\n━━━━━━━━━━━━━━━━━━━━\n_*0* back · *6* menu_`,
+    text: `Please select a payment plan:\n\n  *1* 💰  Full Amount\n  *2* 📆  Installments _(40% / 40% / 20%)_\n\n_*0* back · *6* menu_`,
+    nextStep: 'choose_plan', sessionData: data
+  }
+}
+
+// ── Payment method menu (shared by both plans) ────────────────
+function methodMenu(data) {
+  return {
+    text: `💳 *Payment Summary*\n━━━━━━━━━━━━━━━━━━━━\n\n  👤 *${data.student_name}*\n  📋 ${data.fee_label}\n  💰 *KES ${Number(data.total_amount).toLocaleString()}*\n\n━━━━━━━━━━━━━━━━━━━━\n*Select Payment Method:*\n\n  *1* 📱  M-Pesa STK Push\n  *2* 💳  Card _(Visa / Mastercard)_\n  *3* 🏦  Bank Transfer\n\n━━━━━━━━━━━━━━━━━━━━\n_*0* back · *6* menu_`,
     nextStep: 'choose_method',
-    sessionData: { ...data, selected_fees: selected, total_amount: total, fee_label: label }
+    sessionData: data
   }
 }
 
@@ -2441,22 +3216,24 @@ function chooseMethod(data, body) {
 }
 
 async function doMpesa(data, body, phone) {
+  const lang = langOf(data)
   const raw = body.trim()
   const digits = raw.replace(/\D/g, '')
   if (digits.length < 9 || digits.length > 12) {
-    return {
-      text: `❌ *Invalid Phone Number*\n\nThe number you entered is not valid.\nPlease enter a valid M-Pesa number:\n\n  • *0712345678*\n  • *254712345678*\n\n_*0* back · *6* menu_`,
-      nextStep: 'ask_mpesa_phone', sessionData: data
-    }
+    const txt = lang === 'sw'
+      ? 'Nambari si sahihi. Andika nambari ya M-Pesa, kwa mfano 0712345678'
+      : 'Invalid number. Enter the M-Pesa number, e.g 0712345678'
+    return { text: `SchoolPay\n\n${txt}\n\n${BACK[lang]}`, nextStep: 'ask_mpesa_phone', sessionData: data }
   }
 
   const paystackPhone = toPaystackPhone(raw)
   const ref = generateRef()
+  const email = data.email || `wa-${phone.replace(/\D/g, '')}@schoolpay.ke`
   console.log(`[MPESA] Charging ${paystackPhone} KES ${data.total_amount} ref:${ref}`)
 
   try {
     const res = await axios.post('https://api.paystack.co/charge', {
-      email: data.email,
+      email,
       amount: Math.round(Number(data.total_amount) * 100),
       currency: 'KES', reference: ref,
       mobile_money: { phone: paystackPhone, provider: 'mpesa' },
@@ -2473,29 +3250,32 @@ async function doMpesa(data, body, phone) {
     if (result.status === false) throw new Error(result.message || 'Paystack rejected request')
 
     const status = result.data?.status
-    const displayText = result.data?.display_text || ''
-    await savePending(data, ref, 'mpesa')
+    await savePending({ ...data, email }, ref, 'mpesa')
 
     if (status === 'success') {
       await confirmAndUpdate(ref, data)
       const successMsg = await buildSuccessMessage(
         data.student_id, data.total_amount, data.fee_label,
-        ref, data.email, data.guardian_name, data.student_name
+        ref, email, data.guardian_name, data.student_name
       )
-      return { text: successMsg, nextStep: 'main_menu', sessionData: {} }
+      return { text: successMsg, nextStep: 'main_menu', sessionData: { lang: data.lang } }
     }
 
+    const txt = lang === 'sw'
+      ? `Confirmation\n\nOmbi la malipo limetumwa kwa ${paystackPhone}. Weka PIN yako ya M-Pesa kulipa Ksh ${Number(data.total_amount).toLocaleString()}.\nRef: ${ref}\n\nUtapokea risiti hapa malipo yakithibitishwa.`
+      : `Confirmation\n\nSTK push sent to ${paystackPhone}. Enter your M-Pesa PIN to pay Ksh ${Number(data.total_amount).toLocaleString()}.\nRef: ${ref}\n\nYou will receive a receipt here once the payment is confirmed.`
     return {
-      text: `📱 *M-Pesa — Payment Prompt Sent!*\n━━━━━━━━━━━━━━━━━━━━\n\n✅ A payment request has been sent to:\n   📲 *${paystackPhone}*\n\nPlease *enter your M-Pesa PIN* when the prompt appears on your phone.\n\n  💰 Amount: *KES ${Number(data.total_amount).toLocaleString()}*\n  📋 ${data.fee_label}\n  🔑 Ref: \`${ref}\`\n${displayText ? `\n  _${displayText}_\n` : ''}\n━━━━━━━━━━━━━━━━━━━━\n⏳ You have *60 seconds* to complete this.\n\n_Once confirmed, you will automatically receive a receipt with your remaining balance here._`,
-      nextStep: 'main_menu', sessionData: { waiting_ref: ref, guardian_phone: phone }
+      text: `SchoolPay\n\n${txt}\n\n${HOME[lang]}`,
+      nextStep: 'main_menu',
+      sessionData: { lang: data.lang, waiting_ref: ref, guardian_phone: phone }
     }
   } catch (err) {
     const msg = err.response?.data?.message || err.message || 'Unknown error'
     console.error('[MPESA] Error:', msg)
-    return {
-      text: `❌ *M-Pesa Payment Failed*\n━━━━━━━━━━━━━━━━━━━━\n\n_${msg}_\n\n*What to check:*\n  • Ensure M-Pesa is activated on the number\n  • Use format: *0712345678*\n  • Ensure you have sufficient balance\n\n━━━━━━━━━━━━━━━━━━━━\n  *1* → Retry M-Pesa\n  *2* → Pay by Card\n\n_*0* back · *6* menu_`,
-      nextStep: 'choose_method', sessionData: data
-    }
+    const txt = lang === 'sw'
+      ? `Malipo ya M-Pesa yameshindikana:\n${msg}\n\nAndika nambari ya M-Pesa tena ujaribu.`
+      : `M-Pesa payment failed:\n${msg}\n\nEnter the M-Pesa number again to retry.`
+    return { text: `SchoolPay\n\n${txt}\n\n${BACK[lang]}`, nextStep: 'ask_mpesa_phone', sessionData: data }
   }
 }
 
@@ -2657,7 +3437,7 @@ app.post('/api/send-reminder', async (req, res) => {
     const rawPhone = student.guardian1_whatsapp || student.guardian1_phone
     if (!rawPhone) return res.status(400).json({ error: 'No phone number for guardian' })
 
-    const msg = `🔔 *Payment Reminder*\n\nDear *${student.guardian1_name}*,\n\nOutstanding fees for *${student.first_name} ${student.last_name}* (${cls}):${lines}\n\n💰 *Total: KES ${total.toLocaleString()}*\n\nWhatsApp *hi* to pay or *balance* to check fees 😊\n\n🙏 Thank you!`
+    const msg = `🔔 *Payment Reminder*\n\nDear *${student.guardian1_name}*,\n\nOutstanding fees for *${student.first_name} ${student.last_name}* (${cls}):${lines}\n\n💰 *Total: KES ${total.toLocaleString()}*\n\n📆 _You can pay in installments — 40% this month, 40% next month, 20% the final month._\n\nWhatsApp *hi* to pay or *balance* to check fees 😊\n\n🙏 Thank you!`
 
     if (student.guardian1_whatsapp) {
       await sendWA(student.guardian1_whatsapp, msg)
@@ -2693,7 +3473,7 @@ app.post('/api/send-reminders', async (req, res) => {
 
       const lines = sd.fees.map(f => `• ${f.fee_name}: KES ${Number(f.balance).toLocaleString()}`).join('\n')
       const total = sd.fees.reduce((s, f) => s + Number(f.balance), 0)
-      const msg = `🔔 *Payment Reminder*\n\nDear *${s.guardian1_name}*,\n\nOutstanding fees for *${sd.name}*:\n\n${lines}\n\n💰 *Total: KES ${total.toLocaleString()}*\n\nType *hi* to pay or *balance* to check fees 😊\n\n🙏 Thank you!`
+      const msg = `🔔 *Payment Reminder*\n\nDear *${s.guardian1_name}*,\n\nOutstanding fees for *${sd.name}*:\n\n${lines}\n\n💰 *Total: KES ${total.toLocaleString()}*\n\n📆 _You can pay in installments — 40% this month, 40% next month, 20% the final month._\n\nType *hi* to pay or *balance* to check fees 😊\n\n🙏 Thank you!`
 
       if (s.guardian1_whatsapp) {
         await sendWA(s.guardian1_whatsapp, msg)
@@ -2718,7 +3498,8 @@ async function savePending(data, ref, method) {
     try {
       await supabase.from('payments').insert({
         school_id: SCHOOL_ID, student_id: data.student_id,
-        student_fee_id: fee.student_fee_id, amount: Number(fee.balance),
+        student_fee_id: fee.student_fee_id,
+        amount: Number(fee.pay_amount != null ? fee.pay_amount : fee.balance),
         payment_method: method, paystack_reference: ref,
         paid_by_email: data.email, paid_by_name: data.guardian_name || 'Guardian', status: 'pending'
       })
@@ -2731,7 +3512,7 @@ async function confirmAndUpdate(ref, data) {
   for (const fee of (data.selected_fees || [])) {
     const { data: sf } = await supabase.from('student_fees').select('*').eq('id', fee.student_fee_id).single()
     if (!sf) continue
-    const newPaid = Number(sf.amount_paid) + Number(fee.balance)
+    const newPaid = Number(sf.amount_paid) + Number(fee.pay_amount != null ? fee.pay_amount : fee.balance)
     await supabase.from('student_fees').update({
       amount_paid: newPaid,
       status: newPaid >= Number(sf.amount_due) ? 'paid' : 'partial',
@@ -2784,4 +3565,8 @@ app.get('/health', (_, res) => res.json({
 }))
 
 const PORT = process.env.PORT || 3000
-app.listen(PORT, () => console.log(`🚀 SchoolPay Bot running on port ${PORT}`))
+if (require.main === module) {
+  app.listen(PORT, () => console.log(`🚀 SchoolPay Bot running on port ${PORT}`))
+}
+
+module.exports = { app, handleUSSD, handleMessage }
