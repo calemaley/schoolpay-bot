@@ -118,24 +118,24 @@ async function chat() {
 
   // ════════ WhatsApp/SMS — English ════════
   let c = await chat()
-  expect('EN main menu', await c.send('hi'), 'SchoolPay', '1. Pay Fees', '2. Check fee balance', '3. Academic results', '4. Badili lugha')
-  expect('EN pay → child list', await c.send('1'), '1. Clarence Kioko Mueni - School XYZ', '2. Help', '* Back')
-  expect('EN payment progress', await c.send('1'), 'Payment progress', '1. Lipa pole pole', '2. Pay all Term 2 fees')
-  expect('EN pole pole amount', await c.send('1'), `${mon} balance Ksh 8,000`, '1. Pay full balance', 'or reply with amount, e.g Ksh 3,000')
+  expect('EN main menu', await c.send('hi'), 'SchoolPay', '💳', 'Pay Fees', 'Check fee balance', 'Academic results', 'Badili lugha')
+  expect('EN pay → child list', await c.send('1'), 'Clarence Kioko Mueni - School XYZ', 'Help', '* Back')
+  expect('EN payment progress', await c.send('1'), 'Payment progress', 'Lipa pole pole', 'Pay all Term 2 fees')
+  expect('EN pole pole amount', await c.send('1'), `${mon} balance: Ksh 8,000`, 'Pay full balance', 'or reply with amount, e.g Ksh 3,000')
   expect('EN custom amount → mpesa', await c.send('3000'), 'Enter M-Pesa number for payment')
   expect('EN confirmation', await c.send('0712345678'), 'Confirmation', 'STK push sent', 'Ksh 3,000', '* Home')
 
   // back navigation with '*'
   c = await chat()
   await c.send('hi'); await c.send('1'); await c.send('1')
-  expect('EN full-term amount', await c.send('2'), 'Term 2 full balance Ksh 20,000')
+  expect('EN full-term amount', await c.send('2'), 'Term 2 full balance: Ksh 20,000')
   expect('EN pay full → mpesa', await c.send('1'), 'Enter M-Pesa number for payment')
   expect('EN * back → re-prompt amount', await c.send('*'), 'Pay full balance')
 
   // balance flow
   c = await chat()
   await c.send('hi'); await c.send('2')
-  expect('EN balance screen', await c.send('1'), `${mon} balance Ksh 8,000`, 'Term 2 full balance Ksh 20,000', '1. Payment Statement')
+  expect('EN balance screen', await c.send('1'), `${mon} balance: Ksh 8,000`, 'Term 2 full balance: Ksh 20,000', 'Payment Statement')
   expect('EN statement shared', await c.send('1'), 'Payment Statement shared', 'Total paid: Ksh 6,500', '* Home')
 
   // results flow
@@ -147,28 +147,28 @@ async function chat() {
   // help (child listed)
   c = await chat()
   await c.send('hi'); await c.send('1')
-  expect('EN help menu', await c.send('2'), '1. Clarence Kioko Mueni is not my child', '2. I have another child in this school')
+  expect('EN help menu', await c.send('2'), 'Clarence Kioko Mueni is not my child', 'I have another child in this school')
   expect('EN help thanks', await c.send('1'), 'Thank you', 'school office', '* Home')
 
   // ════════ WhatsApp/SMS — Kiswahili ════════
   c = await chat()
   await c.send('hi')
-  expect('SW main menu', await c.send('4'), '1. Lipa karo', '2. Karo idaiwayo', '3. Matokeo ya elimu', '4. Back to english')
-  expect('SW child list', await c.send('1'), 'Clarence Kioko Mueni - School XYZ', '2. Msaada', '* Rudi')
-  expect('SW payment progress', await c.send('1'), '1. Lipa pole pole', '2. Lipa salio lote la muhula wa pili')
-  expect('SW amount', await c.send('1'), 'Salio la', '1. Lipa pesa yote', 'au andika malipo')
+  expect('SW main menu', await c.send('4'), 'Lipa karo', 'Karo idaiwayo', 'Matokeo ya elimu', 'Back to english')
+  expect('SW child list', await c.send('1'), 'Clarence Kioko Mueni - School XYZ', 'Msaada', '* Rudi')
+  expect('SW payment progress', await c.send('1'), 'Lipa pole pole', 'Lipa salio lote la muhula wa pili')
+  expect('SW amount', await c.send('1'), 'Salio la', 'Lipa pesa yote', 'au andika malipo')
   expect('SW mpesa prompt', await c.send('1'), 'Andika nambari ya M-Pesa kwa ajili ya malipo')
   expect('SW confirmation', await c.send('0712345678'), 'Confirmation', 'PIN', '* Rudi mwanzo')
 
   c = await chat()
   await c.send('hi'); await c.send('4'); await c.send('2');
-  expect('SW balance', await c.send('1'), 'Salio la', 'Muhula wa pili', '1. Risiti ya malipo')
+  expect('SW balance', await c.send('1'), 'Salio la', 'Muhula wa pili', 'Risiti ya malipo')
   expect('SW statement', await c.send('1'), 'Risiti ya malipo imetumwa', '* Rudi mwanzo')
 
   // toggle back to english
   c = await chat()
   await c.send('hi'); await c.send('4')
-  expect('SW → EN toggle', await c.send('4'), '1. Pay Fees')
+  expect('SW → EN toggle', await c.send('4'), 'Pay Fees', '💳')
 
   // ════════ USSD ════════
   const u = (text) => handleUSSD('sess-1', GUARDIAN_PHONE, text ? text.split('*') : [])

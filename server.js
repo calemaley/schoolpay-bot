@@ -133,8 +133,8 @@ function termLabel(lang, d = new Date()) {
   return lang === 'sw' ? TERMS_SW[t] : `Term ${t}`
 }
 
-const BACK = { en: '* Back', sw: '* Rudi' }
-const HOME = { en: '* Home', sw: '* Rudi mwanzo' }
+const BACK = { en: '◀️ * Back', sw: '◀️ * Rudi' }
+const HOME = { en: '🏠 * Home', sw: '🏠 * Rudi mwanzo' }
 const SCHOOL_LABEL = () => process.env.SCHOOL_NAME || 'School XYZ'
 
 // Children linked to the texting/dialling guardian phone (last 9 digits)
@@ -210,20 +210,28 @@ async function logHelpRequest(phone, issue) {
 }
 
 // ============================================================
-// WHATSAPP / SMS SCREENS (per Figma)
+// WHATSAPP / SMS SCREENS (per Figma, styled)
 // ============================================================
+const DIV = '━━━━━━━━━━━━━━━━━━━━'
+
+// Consistent card layout: header band, body, divider, italic footer
+function screen(body, footer) {
+  return `🏫 *SchoolPay*\n${DIV}\n\n${body}\n\n${DIV}\n_${footer}_`
+}
+
 function mainMenu(data = {}) {
   const lang = langOf(data)
   const items = lang === 'sw'
-    ? `1. Lipa karo\n2. Karo idaiwayo\n3. Matokeo ya elimu\n4. Back to english`
-    : `1. Pay Fees\n2. Check fee balance\n3. Academic results\n4. Badili lugha`
-  return { text: `SchoolPay\n\n${items}`, nextStep: 'main_menu', sessionData: { lang: data.lang } }
+    ? `  *1.* 💳  Lipa karo\n  *2.* 📊  Karo idaiwayo\n  *3.* 📚  Matokeo ya elimu\n  *4.* 🌍  Back to english`
+    : `  *1.* 💳  Pay Fees\n  *2.* 📊  Check fee balance\n  *3.* 📚  Academic results\n  *4.* 🌍  Badili lugha`
+  const hint = lang === 'sw' ? 'Andika nambari kuchagua' : 'Type a number to select'
+  return { text: screen(items, hint), nextStep: 'main_menu', sessionData: { lang: data.lang } }
 }
 
 function invalidReply(data, step) {
   const lang = langOf(data)
-  const txt = lang === 'sw' ? 'Chaguo si sahihi. Jaribu tena.' : 'Invalid choice. Please try again.'
-  return { text: `SchoolPay\n\n${txt}\n\n${BACK[lang]}`, nextStep: step, sessionData: data }
+  const txt = lang === 'sw' ? '❌ Chaguo si sahihi. Jaribu tena.' : '❌ Invalid choice. Please try again.'
+  return { text: screen(txt, BACK[lang]), nextStep: step, sessionData: data }
 }
 
 // Entry to every flow: list the guardian's children (Figma child-select card)
@@ -231,11 +239,11 @@ async function startFlow(data, phone, purpose) {
   const lang = langOf(data)
   const children = await findChildrenByPhone(phone)
   if (!children.length) return helpMissingMenu({ lang: data.lang })
-  let msg = `SchoolPay\n\n`
-  children.forEach((c, i) => { msg += `${i + 1}. ${c.first_name} ${c.last_name} - ${SCHOOL_LABEL()}\n` })
-  msg += `${children.length + 1}. ${lang === 'sw' ? 'Msaada' : 'Help'}\n\n${BACK[lang]}`
+  let body = ''
+  children.forEach((c, i) => { body += `  *${i + 1}.* 👤  ${c.first_name} ${c.last_name} - ${SCHOOL_LABEL()}\n` })
+  body += `  *${children.length + 1}.* ❓  ${lang === 'sw' ? 'Msaada' : 'Help'}`
   return {
-    text: msg, nextStep: 'pick_child',
+    text: screen(body, BACK[lang]), nextStep: 'pick_child',
     sessionData: {
       lang: data.lang, _purpose: purpose,
       _children: children.map(c => ({
@@ -267,16 +275,17 @@ async function paymentProgressMenu(data) {
   const outstanding = (allFees || []).filter(f => Number(f.balance) > 0)
   if (!outstanding.length) {
     const txt = lang === 'sw'
-      ? `${data.student_name} hana salio la karo. Karo yote imelipwa.`
-      : `${data.student_name} has no outstanding fees. All fees are cleared.`
-    return { text: `SchoolPay\n\n${txt}\n\n${HOME[lang]}`, nextStep: 'main_menu', sessionData: { lang: data.lang } }
+      ? `🎉 *${data.student_name}* hana salio la karo.\nKaro yote imelipwa!`
+      : `🎉 *${data.student_name}* has no outstanding fees.\nAll fees are cleared!`
+    return { text: screen(txt, HOME[lang]), nextStep: 'main_menu', sessionData: { lang: data.lang } }
   }
   const term = termLabel(lang)
   const opts = lang === 'sw'
-    ? `1. Lipa pole pole\n2. Lipa salio lote la ${term.toLowerCase()}`
-    : `1. Lipa pole pole\n2. Pay all ${term} fees`
+    ? `  *1.* 🐢  Lipa pole pole\n        _(40% / 40% / 20%)_\n  *2.* 💰  Lipa salio lote la ${term.toLowerCase()}`
+    : `  *1.* 🐢  Lipa pole pole\n        _(40% / 40% / 20%)_\n  *2.* 💰  Pay all ${term} fees`
+  const body = `👤 *${data.student_name}*\n\n💳 *Payment progress*\n\n${opts}`
   return {
-    text: `SchoolPay\n\nPayment progress\n\n${opts}\n\n${BACK[lang]}`,
+    text: screen(body, BACK[lang]),
     nextStep: 'payment_progress',
     sessionData: { ...data, fees: outstanding }
   }
@@ -296,20 +305,22 @@ function amountScreen(data) {
     amount = buildInstallmentSelection(fees).total
     const mon = monthName(new Date(), lang)
     label = lang === 'sw'
-      ? `Salio la ${mon} Ksh ${amount.toLocaleString()}`
-      : `${mon} balance Ksh ${amount.toLocaleString()}`
+      ? `💰 *Salio la ${mon}: Ksh ${amount.toLocaleString()}*`
+      : `💰 *${mon} balance: Ksh ${amount.toLocaleString()}*`
   } else {
     amount = fees.reduce((s, f) => s + Number(f.balance), 0)
     const term = termLabel(lang)
     label = lang === 'sw'
-      ? `Salio la ${term.toLowerCase()} Ksh ${amount.toLocaleString()}`
-      : `${term} full balance Ksh ${amount.toLocaleString()}`
+      ? `💰 *Salio la ${term.toLowerCase()}: Ksh ${amount.toLocaleString()}*`
+      : `💰 *${term} full balance: Ksh ${amount.toLocaleString()}*`
   }
-  const body = lang === 'sw'
-    ? `1. Lipa pesa yote\n\nau andika malipo, kwa mfano, 3,000`
-    : `1. Pay full balance\n\nor reply with amount, e.g Ksh 3,000`
+  const opt  = lang === 'sw' ? `  *1.* ✅  Lipa pesa yote` : `  *1.* ✅  Pay full balance`
+  const note = lang === 'sw'
+    ? `_au andika malipo, kwa mfano, 3,000_`
+    : `_or reply with amount, e.g Ksh 3,000_`
+  const body = `👤 *${data.student_name}*\n\n${label}\n\n${opt}\n\n${note}`
   return {
-    text: `SchoolPay\n\n${label}\n\n${body}\n\n${BACK[lang]}`,
+    text: screen(body, BACK[lang]),
     nextStep: 'ask_amount',
     sessionData: { ...data, _shown_amount: amount }
   }
@@ -318,9 +329,9 @@ function amountScreen(data) {
 function mpesaPrompt(data) {
   const lang = langOf(data)
   const txt = lang === 'sw'
-    ? 'Andika nambari ya M-Pesa kwa ajili ya malipo'
-    : 'Enter M-Pesa number for payment'
-  return { text: `SchoolPay\n\n${txt}\n\n${BACK[lang]}`, nextStep: 'ask_mpesa_phone', sessionData: data }
+    ? `📱 *Andika nambari ya M-Pesa kwa ajili ya malipo*\n\n  _(mfano: 0712 345 678)_`
+    : `📱 *Enter M-Pesa number for payment*\n\n  _(e.g. 0712 345 678)_`
+  return { text: screen(txt, BACK[lang]), nextStep: 'ask_mpesa_phone', sessionData: data }
 }
 
 async function handleAmount(data, n, raw) {
@@ -330,9 +341,9 @@ async function handleAmount(data, n, raw) {
   const amount = n === '1' ? Number(data._shown_amount) : parseAmount(raw)
   if (!amount || amount <= 0 || amount > termTotal) {
     const txt = lang === 'sw'
-      ? `Kiasi si sahihi. Andika kiasi kati ya 1 na ${termTotal.toLocaleString()}, au 1 kulipa pesa yote.`
-      : `Invalid amount. Reply with an amount between 1 and ${termTotal.toLocaleString()}, or 1 to pay the full balance.`
-    return { text: `SchoolPay\n\n${txt}\n\n${BACK[lang]}`, nextStep: 'ask_amount', sessionData: data }
+      ? `❌ Kiasi si sahihi. Andika kiasi kati ya 1 na ${termTotal.toLocaleString()}, au 1 kulipa pesa yote.`
+      : `❌ Invalid amount. Reply with an amount between 1 and ${termTotal.toLocaleString()}, or 1 to pay the full balance.`
+    return { text: screen(txt, BACK[lang]), nextStep: 'ask_amount', sessionData: data }
   }
   const selected = allocateAmount(fees, amount)
   const feeLabel = `${termLabel('en')} fees${data.plan === 'pole' ? ' — Lipa pole pole' : ''}`
@@ -350,13 +361,14 @@ async function balanceScreen(data) {
   const mon  = monthName(new Date(), lang)
   const term = termLabel(lang)
   const lines = !outstanding.length
-    ? (lang === 'sw' ? 'Karo yote imelipwa. Hakuna salio.' : 'All fees are cleared. No balance due.')
+    ? (lang === 'sw' ? '🎉 Karo yote imelipwa. Hakuna salio.' : '🎉 All fees are cleared. No balance due.')
     : (lang === 'sw'
-        ? `Salio la ${mon} ni Ksh ${monthDue.toLocaleString()}\nSalio la ${term} ni Ksh ${termTotal.toLocaleString()}`
-        : `${mon} balance Ksh ${monthDue.toLocaleString()}\n${term} full balance Ksh ${termTotal.toLocaleString()}`)
-  const opt = lang === 'sw' ? '1. Risiti ya malipo' : '1. Payment Statement'
+        ? `💰 *Salio la ${mon}: Ksh ${monthDue.toLocaleString()}*\n💰 *Salio la ${term}: Ksh ${termTotal.toLocaleString()}*`
+        : `💰 *${mon} balance: Ksh ${monthDue.toLocaleString()}*\n💰 *${term} full balance: Ksh ${termTotal.toLocaleString()}*`)
+  const opt = lang === 'sw' ? `  *1.* 📄  Risiti ya malipo` : `  *1.* 📄  Payment Statement`
+  const body = `👤 *${data.student_name}*\n\n${lines}\n\n${opt}`
   return {
-    text: `SchoolPay\n\n${lines}\n\n${opt}\n\n${BACK[lang]}`,
+    text: screen(body, BACK[lang]),
     nextStep: 'balance_menu',
     sessionData: data
   }
@@ -376,14 +388,16 @@ async function shareStatement(data, phone, channel) {
 
   let body = ''
   if (!payments || !payments.length) {
-    body = lang === 'sw' ? 'Hakuna malipo yaliyorekodiwa bado.' : 'No payments recorded yet.'
+    body = lang === 'sw' ? 'ℹ️ Hakuna malipo yaliyorekodiwa bado.' : 'ℹ️ No payments recorded yet.'
   } else {
     payments.slice(0, 10).forEach(p => {
       const d = new Date(p.created_at).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })
-      body += `${d}  Ksh ${Number(p.amount).toLocaleString()}  ${p.payment_method}\n`
+      body += `  🧾 ${d} — *Ksh ${Number(p.amount).toLocaleString()}* _(${p.payment_method})_\n`
     })
     const total = payments.reduce((s, p) => s + Number(p.amount), 0)
-    body += lang === 'sw' ? `\nJumla iliyolipwa: Ksh ${total.toLocaleString()}` : `\nTotal paid: Ksh ${total.toLocaleString()}`
+    body += lang === 'sw'
+      ? `\n💰 *Jumla iliyolipwa: Ksh ${total.toLocaleString()}*`
+      : `\n💰 *Total paid: Ksh ${total.toLocaleString()}*`
   }
 
   // WhatsApp users also get the official PDF in the background
@@ -398,9 +412,9 @@ async function shareStatement(data, phone, channel) {
       .catch(e => console.error('shareStatement pdf:', e.message))
   }
 
-  const shared = lang === 'sw' ? 'Risiti ya malipo imetumwa' : 'Payment Statement shared'
+  const shared = lang === 'sw' ? '✅ *Risiti ya malipo imetumwa*' : '✅ *Payment Statement shared*'
   return {
-    text: `SchoolPay\n\n${shared}\n\n${data.student_name}\n${body}\n\n${HOME[lang]}`,
+    text: screen(`${shared}\n\n👤 *${data.student_name}*\n\n${body}`, HOME[lang]),
     nextStep: 'main_menu',
     sessionData: { lang: data.lang }
   }
@@ -413,9 +427,9 @@ async function resultsMonthMenu(data) {
     .select('*').eq('student_id', data.student_id)
   if (!results || !results.length) {
     const txt = lang === 'sw'
-      ? `Hakuna matokeo ya ${data.student_name} bado.`
-      : `No results recorded for ${data.student_name} yet.`
-    return { text: `SchoolPay\n\n${txt}\n\n${HOME[lang]}`, nextStep: 'main_menu', sessionData: { lang: data.lang } }
+      ? `📚 Hakuna matokeo ya *${data.student_name}* bado.`
+      : `📚 No results recorded for *${data.student_name}* yet.`
+    return { text: screen(txt, HOME[lang]), nextStep: 'main_menu', sessionData: { lang: data.lang } }
   }
   const seen = new Set()
   let periods = []
@@ -425,12 +439,12 @@ async function resultsMonthMenu(data) {
   })
   periods.sort((a, b) => b.sort - a.sort)
   periods = periods.slice(0, 5)
-  const ready = lang === 'sw' ? `Matokeo ya ${periods[0].sw} tayari` : `${periods[0].en} results ready`
-  let msg = `SchoolPay\n\n${ready}\n\n`
-  periods.forEach((p, i) => { msg += `${i + 1}. ${p.label}\n` })
-  msg += `${periods.length + 1}. All\n\n${BACK[lang]}`
+  const ready = lang === 'sw' ? `📚 *Matokeo ya ${periods[0].sw} tayari*` : `📚 *${periods[0].en} results ready*`
+  let body = `👤 *${data.student_name}*\n\n${ready}\n\n`
+  periods.forEach((p, i) => { body += `  *${i + 1}.* ${p.label}\n` })
+  body += `  *${periods.length + 1}.* All`
   return {
-    text: msg, nextStep: 'pick_results_month',
+    text: screen(body, BACK[lang]), nextStep: 'pick_results_month',
     sessionData: { ...data, _periods: periods.map(p => ({ key: p.key, en: p.en, sw: p.sw, label: p.label })) }
   }
 }
@@ -464,16 +478,16 @@ async function handleResultsMonth(data, n) {
   const avgs = []
   Object.entries(bySubj).sort().forEach(([subj, pcts]) => {
     const avg = Math.round(pcts.reduce((a, b) => a + b, 0) / pcts.length)
-    body += `${subj}: ${avg}% ${gradeLabel(avg)}\n`
+    body += `  📚 ${subj}: *${avg}%  ${gradeLabel(avg)}*\n`
     avgs.push(avg)
   })
   if (avgs.length) {
     const overall = Math.round(avgs.reduce((a, b) => a + b, 0) / avgs.length)
-    body += (lang === 'sw' ? 'Wastani' : 'Overall') + `: ${overall}% ${gradeLabel(overall)}\n`
+    body += `\n📈 *${lang === 'sw' ? 'Wastani' : 'Overall'}: ${overall}%  ${gradeLabel(overall)}*`
   }
-  const shared = lang === 'sw' ? `Matokeo ya ${labelSw} yametumwa` : `${labelEn} results shared`
+  const shared = lang === 'sw' ? `✅ *Matokeo ya ${labelSw} yametumwa*` : `✅ *${labelEn} results shared*`
   return {
-    text: `SchoolPay\n\n${shared}\n\n${data.student_name}\n${body}\n${HOME[lang]}`,
+    text: screen(`${shared}\n\n👤 *${data.student_name}*\n\n${body}`, HOME[lang]),
     nextStep: 'main_menu',
     sessionData: { lang: data.lang }
   }
@@ -483,29 +497,28 @@ async function handleResultsMonth(data, n) {
 function helpListedMenu(data) {
   const lang = langOf(data)
   const kids = data._children || []
-  let msg = `SchoolPay\n\n`
+  let body = `❓ *${lang === 'sw' ? 'Msaada' : 'Help'}*\n\n`
   kids.forEach((k, i) => {
-    msg += lang === 'sw'
-      ? `${i + 1}. ${k.name} sio mwanangu\n`
-      : `${i + 1}. ${k.name} is not my child\n`
+    body += lang === 'sw'
+      ? `  *${i + 1}.* ${k.name} sio mwanangu\n`
+      : `  *${i + 1}.* ${k.name} is not my child\n`
   })
-  msg += lang === 'sw'
-    ? `${kids.length + 1}. Niko na mtoto mwingine katika shule hii\n`
-    : `${kids.length + 1}. I have another child in this school\n`
-  msg += `\n${BACK[lang]}`
-  return { text: msg, nextStep: 'help_menu', sessionData: data }
+  body += lang === 'sw'
+    ? `  *${kids.length + 1}.* Niko na mtoto mwingine katika shule hii`
+    : `  *${kids.length + 1}.* I have another child in this school`
+  return { text: screen(body, BACK[lang]), nextStep: 'help_menu', sessionData: data }
 }
 
 function helpMissingMenu(data) {
   const lang = langOf(data)
   const intro = lang === 'sw'
-    ? 'Hakuna mtoto aliyeunganishwa na nambari hii.'
-    : 'No child is linked to this phone number.'
+    ? '❓ Hakuna mtoto aliyeunganishwa na nambari hii.'
+    : '❓ No child is linked to this phone number.'
   const opt = lang === 'sw'
-    ? '1. Sioni jina la mwanangu katika orodha'
-    : '1. I cannot see my child listed'
+    ? `  *1.* Sioni jina la mwanangu katika orodha`
+    : `  *1.* I cannot see my child listed`
   return {
-    text: `SchoolPay\n\n${intro}\n\n${opt}\n\n${BACK[lang]}`,
+    text: screen(`${intro}\n\n${opt}`, BACK[lang]),
     nextStep: 'help_menu',
     sessionData: { lang: data.lang, _children: [] }
   }
@@ -526,9 +539,9 @@ async function handleHelpChoice(data, n, phone) {
   if (!issue) return invalidReply(data, 'help_menu')
   logHelpRequest(phone, issue).catch(() => {})
   const txt = lang === 'sw'
-    ? 'Asante. Ofisi ya shule imearifiwa na itawasiliana nawe hivi karibuni.'
-    : 'Thank you. The school office has been notified and will contact you shortly.'
-  return { text: `SchoolPay\n\n${txt}\n\n${HOME[lang]}`, nextStep: 'main_menu', sessionData: { lang: data.lang } }
+    ? '🙏 *Asante!*\n\nOfisi ya shule imearifiwa na itawasiliana nawe hivi karibuni.'
+    : '🙏 *Thank you!*\n\nThe school office has been notified and will contact you shortly.'
+  return { text: screen(txt, HOME[lang]), nextStep: 'main_menu', sessionData: { lang: data.lang } }
 }
 
 // Email transporter (SMTP — set EMAIL_HOST, EMAIL_USER, EMAIL_PASS in Render env)
@@ -539,9 +552,16 @@ const emailTransporter = nodemailer.createTransport({
   auth: { user: process.env.EMAIL_USER, pass: process.env.EMAIL_PASS }
 })
 
-// Strip WhatsApp markdown so SMS arrives as clean plain text
+// Strip WhatsApp markdown so SMS arrives as clean plain text.
+// Only paired markers within one line are removed, so literal
+// navigation hints like "* Back" survive.
 function stripMarkdown(text) {
-  return text.replace(/\*/g, '').replace(/_/g, '').replace(/━/g, '-').trim()
+  return text
+    .replace(/\*([^*\n]+)\*/g, '$1')
+    .replace(/_([^_\n]+)_/g, '$1')
+    .replace(/`([^`\n]+)`/g, '$1')
+    .replace(/━/g, '-')
+    .trim()
 }
 
 // ── Typo-tolerant input normaliser ───────────────────────────
@@ -1407,10 +1427,12 @@ async function handleMainMenuChoice(data, n, phone) {
     case '3': return await startFlow(data, phone, 'results')
     case '4': return mainMenu({ lang: langOf(data) === 'sw' ? 'en' : 'sw' })
     default: {
-      const txt = langOf(data) === 'sw'
-        ? 'Tafadhali andika nambari 1 hadi 4.'
-        : 'Please reply with a number 1 to 4.'
-      return { text: `SchoolPay\n\n${txt}`, nextStep: 'main_menu', sessionData: data }
+      const lang = langOf(data)
+      const txt = lang === 'sw'
+        ? '❌ Tafadhali andika nambari 1 hadi 4.'
+        : '❌ Please reply with a number 1 to 4.'
+      const hint = lang === 'sw' ? 'Andika nambari kuchagua' : 'Type a number to select'
+      return { text: screen(txt, hint), nextStep: 'main_menu', sessionData: data }
     }
   }
 }
@@ -3221,9 +3243,9 @@ async function doMpesa(data, body, phone) {
   const digits = raw.replace(/\D/g, '')
   if (digits.length < 9 || digits.length > 12) {
     const txt = lang === 'sw'
-      ? 'Nambari si sahihi. Andika nambari ya M-Pesa, kwa mfano 0712345678'
-      : 'Invalid number. Enter the M-Pesa number, e.g 0712345678'
-    return { text: `SchoolPay\n\n${txt}\n\n${BACK[lang]}`, nextStep: 'ask_mpesa_phone', sessionData: data }
+      ? '❌ Nambari si sahihi.\n\n📱 Andika nambari ya M-Pesa, kwa mfano *0712345678*'
+      : '❌ Invalid number.\n\n📱 Enter the M-Pesa number, e.g *0712345678*'
+    return { text: screen(txt, BACK[lang]), nextStep: 'ask_mpesa_phone', sessionData: data }
   }
 
   const paystackPhone = toPaystackPhone(raw)
@@ -3262,10 +3284,10 @@ async function doMpesa(data, body, phone) {
     }
 
     const txt = lang === 'sw'
-      ? `Confirmation\n\nOmbi la malipo limetumwa kwa ${paystackPhone}. Weka PIN yako ya M-Pesa kulipa Ksh ${Number(data.total_amount).toLocaleString()}.\nRef: ${ref}\n\nUtapokea risiti hapa malipo yakithibitishwa.`
-      : `Confirmation\n\nSTK push sent to ${paystackPhone}. Enter your M-Pesa PIN to pay Ksh ${Number(data.total_amount).toLocaleString()}.\nRef: ${ref}\n\nYou will receive a receipt here once the payment is confirmed.`
+      ? `✅ *Confirmation*\n\n📲 Ombi la malipo limetumwa kwa *${paystackPhone}*.\nWeka PIN yako ya M-Pesa kulipa *Ksh ${Number(data.total_amount).toLocaleString()}*.\n\n  🔑 Ref: \`${ref}\`\n\n_Utapokea risiti hapa malipo yakithibitishwa._`
+      : `✅ *Confirmation*\n\n📲 STK push sent to *${paystackPhone}*.\nEnter your M-Pesa PIN to pay *Ksh ${Number(data.total_amount).toLocaleString()}*.\n\n  🔑 Ref: \`${ref}\`\n\n_You will receive a receipt here once the payment is confirmed._`
     return {
-      text: `SchoolPay\n\n${txt}\n\n${HOME[lang]}`,
+      text: screen(txt, HOME[lang]),
       nextStep: 'main_menu',
       sessionData: { lang: data.lang, waiting_ref: ref, guardian_phone: phone }
     }
@@ -3273,9 +3295,9 @@ async function doMpesa(data, body, phone) {
     const msg = err.response?.data?.message || err.message || 'Unknown error'
     console.error('[MPESA] Error:', msg)
     const txt = lang === 'sw'
-      ? `Malipo ya M-Pesa yameshindikana:\n${msg}\n\nAndika nambari ya M-Pesa tena ujaribu.`
-      : `M-Pesa payment failed:\n${msg}\n\nEnter the M-Pesa number again to retry.`
-    return { text: `SchoolPay\n\n${txt}\n\n${BACK[lang]}`, nextStep: 'ask_mpesa_phone', sessionData: data }
+      ? `❌ *Malipo ya M-Pesa yameshindikana*\n\n_${msg}_\n\n📱 Andika nambari ya M-Pesa tena ujaribu.`
+      : `❌ *M-Pesa payment failed*\n\n_${msg}_\n\n📱 Enter the M-Pesa number again to retry.`
+    return { text: screen(txt, BACK[lang]), nextStep: 'ask_mpesa_phone', sessionData: data }
   }
 }
 
